@@ -262,12 +262,12 @@ class LanguageModelModule(pl.LightningModule):
             preds = torch.argmax(logits, dim=-1)
             acc = (preds == targets).float().mean()
             
-            if stage.endswith("/train"):
+            if stage.endswith("/train") or stage.endswith("/alignment"):
                 self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
-                self.log(f"{stage}/accuracy", acc, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
+                self.log(f"{stage}/acc", acc, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
             else:
                 self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True, add_dataloader_idx=False)
-                self.log(f"{stage}/accuracy", acc, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True, add_dataloader_idx=False)
+                self.log(f"{stage}/acc", acc, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True, add_dataloader_idx=False)
             
             self._last_logits = logits
             self._last_targets = targets
@@ -391,7 +391,7 @@ class LanguageModelModule(pl.LightningModule):
             if val_task_names is not None:
                 print(f"WARNING: dataloader_idx={dataloader_idx} is out of bounds for val_task_names={val_task_names}. Falling back to active_task={task_name}")
 
-        stage = f"{task_name}/val"
+        stage = f"{task_name}/validation"
         loss, acc = self._shared_step(batch, stage, task_name=task_name)
         if loss is not None:
             self._val_losses.append(loss.detach())
@@ -412,14 +412,11 @@ class LanguageModelModule(pl.LightningModule):
         if self.logging_disabled:
             return
 
+        # Per-task validation metrics are logged inside validation_step via _shared_step.
+        # Keep internal buffers clear for the next validation epoch.
         if hasattr(self, "_val_losses") and self._val_losses:
-            total_loss = torch.stack(self._val_losses).mean()
-            self.log("val/loss", total_loss, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True)
             self._val_losses.clear()
-
         if hasattr(self, "_val_accs") and self._val_accs:
-            total_acc = torch.stack(self._val_accs).mean()
-            self.log("val/accuracy", total_acc, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True)
             self._val_accs.clear()
 
         # Item 10: Print per-class prediction frequencies (only if run_debug_checks is True)

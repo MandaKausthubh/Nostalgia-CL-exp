@@ -21,6 +21,8 @@ class NostalgiaWandbLogger(PLWandbLogger):
             phase = getattr(self.model, "training_phase", None)
             if phase == "nostalgia":
                 step = getattr(self.model, "global_step_counter", step)
+            elif phase == "head_align":
+                step = getattr(self.model, "alignment_step_counter", step)
         super().log_metrics(metrics, step=step)
 
 

@@ -1,0 +1,24 @@
+2026-07-06 01:18:09,722 INFO    MainThread:14179 [wandb_setup.py:_flush():81] Current SDK version is 0.27.2
+2026-07-06 01:18:09,722 INFO    MainThread:14179 [wandb_setup.py:_flush():81] Configure stats pid to 14179
+2026-07-06 01:18:09,722 INFO    MainThread:14179 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-07-06 01:18:09,722 INFO    MainThread:14179 [wandb_init.py:setup_run_log_directory():723] Logging user logs to wandb/offline-run-20260706_011809-3ug2hrnk/logs/debug.log
+2026-07-06 01:18:09,722 INFO    MainThread:14179 [wandb_init.py:setup_run_log_directory():724] Logging internal logs to wandb/offline-run-20260706_011809-3ug2hrnk/logs/debug-internal.log
+2026-07-06 01:18:09,723 INFO    MainThread:14179 [wandb_init.py:init():766] calling init triggers
+2026-07-06 01:18:09,723 INFO    MainThread:14179 [wandb_init.py:init():771] wandb.init called with sweep_config: {}
+config: {'_wandb': {}}
+2026-07-06 01:18:09,723 INFO    MainThread:14179 [wandb_init.py:init():814] starting backend
+2026-07-06 01:18:09,965 INFO    MainThread:14179 [wandb_init.py:init():829] sending inform_init request
+2026-07-06 01:18:10,103 INFO    MainThread:14179 [wandb_init.py:init():834] backend started and connected
+2026-07-06 01:18:10,105 INFO    MainThread:14179 [wandb_init.py:init():904] updated telemetry
+2026-07-06 01:18:10,124 INFO    MainThread:14179 [wandb_init.py:init():927] communicating run to backend with 90.0 second timeout
+2026-07-06 01:18:10,127 INFO    MainThread:14179 [wandb_init.py:init():972] starting run threads in backend
+2026-07-06 01:18:10,164 INFO    MainThread:14179 [wandb_run.py:_console_start():2523] atexit reg
+2026-07-06 01:18:10,164 INFO    MainThread:14179 [wandb_run.py:_redirect():2373] redirect: wrap_raw
+2026-07-06 01:18:10,164 INFO    MainThread:14179 [wandb_run.py:_redirect():2442] Wrapping output streams.
+2026-07-06 01:18:10,165 INFO    MainThread:14179 [wandb_run.py:_redirect():2465] Redirects installed.
+2026-07-06 01:18:10,166 INFO    MainThread:14179 [wandb_init.py:init():1010] run started, returning control to user process
+2026-07-06 01:18:10,177 INFO    MainThread:14179 [wandb_run.py:_config_callback():1346] config_cb None None {'model_name': 'gpt2', 'lr': 5e-05, 'head_lr': None, 'warmup_steps': 2, 'total_steps': 10, 'tasks_config': {'sst2': [2, 1]}, 'use_lora': False, 'lora_r': 8, 'lora_alpha': 16, 'lora_dropout': 0.05, 'quantization': None, 'pooling': 'last', 'run_debug_checks': False, 'precision': '32-true', 'log_every': 5, 'writer': '<utils.logging.WandbSummaryWriterWrapper object at 0x13c69de50>', 'method': 'nostalgia', 'base_optimizer_name': 'adamw', 'sgd_momentum': 0.9, 'weight_decay': 0.01}
+2026-07-06 01:19:01,975 INFO    MainThread:14179 [wandb_run.py:_finish():2285] finishing run lightning_logs/3ug2hrnk
+2026-07-06 01:19:01,976 INFO    MainThread:14179 [wandb_run.py:_atexit_cleanup():2490] got exitcode: 0
+2026-07-06 01:19:01,976 INFO    MainThread:14179 [wandb_run.py:_restore():2472] restore
+2026-07-06 01:19:01,976 INFO    MainThread:14179 [wandb_run.py:_restore():2478] restore done

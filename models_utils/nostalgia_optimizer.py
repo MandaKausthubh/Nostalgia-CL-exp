@@ -24,6 +24,9 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
         pooling="last",
         run_debug_checks=False,
         precision="32-true",
+        base_optimizer_name="adamw",
+        sgd_momentum=0.9,
+        weight_decay=0.01,
     ):
         super().__init__(
             model_name=model_name,
@@ -45,9 +48,28 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
         self.log_every = log_every
         self.writer = writer
         self.method = method
+        self.base_optimizer_name = base_optimizer_name
+        self.sgd_momentum = sgd_momentum
+        self.weight_decay = weight_decay
+
+    def _build_base_optimizer(self, param_groups):
+        """Instantiate the requested base optimizer."""
+        name = self.base_optimizer_name.lower()
+        if name == "adam":
+            return torch.optim.Adam(param_groups)
+        if name == "adamw":
+            return torch.optim.AdamW(param_groups)
+        if name == "sgd":
+            return torch.optim.SGD(
+                param_groups,
+                momentum=self.sgd_momentum,
+                nesterov=False,
+            )
+        raise ValueError(f"Unknown base optimizer: {self.base_optimizer_name}")
 
     def configure_optimizers(self):
         head_lr = self.hparams.head_lr if getattr(self.hparams, "head_lr", None) is not None else self.hparams.lr
+        weight_decay = getattr(self, "weight_decay", 0.01)
 
         # Split parameters into backbone and head groups
         backbone_params = [p for p in self.backbone.parameters() if p.requires_grad]
@@ -61,31 +83,24 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
             param_groups.append({
                 "params": backbone_params,
                 "lr": self.hparams.lr,
-                "weight_decay": 0.01,
+                "weight_decay": weight_decay,
             })
         if head_params:
             param_groups.append({
                 "params": head_params,
                 "lr": head_lr,
-                "weight_decay": 0.01,
+                "weight_decay": weight_decay,
             })
 
         if not param_groups:
             param_groups = [{"params": [p for p in self.parameters() if p.requires_grad]}]
 
         if self.training_phase == "head_align" or self.method == "naive_adam":
-            # Phase 1 always uses plain AdamW.
-            # naive_adam baseline also uses plain AdamW in Phase 2.
-            optimizer = torch.optim.AdamW(
-                param_groups,
-                lr=self.hparams.lr,
-            )
+            # Phase 1 and naive_adam baseline use the chosen base optimizer directly.
+            optimizer = self._build_base_optimizer(param_groups)
         else:
             # Phase 2 with Nostalgia projection
-            base_optimizer = torch.optim.AdamW(
-                param_groups,
-                lr=self.hparams.lr,
-            )
+            base_optimizer = self._build_base_optimizer(param_groups)
 
             proj_params = [p for p in self.backbone.parameters() if p.requires_grad]
             optimizer = NostalgiaOptimizer(

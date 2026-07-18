@@ -1,12 +1,9 @@
+import json
 import os
 import wandb
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from config import resolve_device_and_quantization
-from datasets_utils.sst2_dataset import SST2DataModule
-from datasets_utils.agnews_dataset import AGNewsDataModule
-from datasets_utils.trec_dataset import TRECDataModule
-from datasets_utils.dbpedia_dataset import DBpediaDataModule
+from config import resolve_device_and_quantization, TASK_REGISTRY
 from datasets_utils.wrappers import TaskClassificationDataset
 from models_utils.nostalgia_optimizer import NostalgiaLanguageModelModule
 from utils.logging import WandbSummaryWriterWrapper, NostalgiaWandbLogger
@@ -17,27 +14,64 @@ from training.phase_scheduler import PhaseSchedulerCallback
 from training.switching_dataloader import SequentialTaskDataModule
 
 
+def _parse_dataset_overrides(value):
+    """Accept either a JSON string or a path to a JSON file."""
+    if value is None:
+        return {}
+    if os.path.exists(value):
+        with open(value, "r") as f:
+            return json.load(f)
+    return json.loads(value)
+
+
+def build_dataset_config(args):
+    """Build per-task dataset config, merging global args with overrides."""
+    default = {
+        "max_length": args.max_length,
+        "batch_size": args.batch_size,
+        "max_train_samples": args.max_train_samples,
+        "max_val_samples": args.max_val_samples,
+    }
+    overrides = _parse_dataset_overrides(getattr(args, "dataset_overrides", None))
+    return {
+        task_name: {**default, **overrides.get(task_name, {})}
+        for task_name in getattr(args, "tasks", ["sst2", "agnews", "trec", "dbpedia"])
+    }
+
+
 def build_tasks(args, data_modules, default_device):
-    """Construct the list of task dicts, each with name, train_ds, and num_classes."""
-    task_defs = [
-        {"name": "sst2",     "dm_key": "sst2",     "num_classes": 2},
-        {"name": "agnews",   "dm_key": "agnews",   "num_classes": 4},
-        {"name": "trec",     "dm_key": "trec",     "num_classes": 6},
-        {"name": "dbpedia",  "dm_key": "dbpedia",  "num_classes": 14},
-    ]
+    """Construct task dicts with per-task loaders and a capped Hessian loader."""
     active_tasks = getattr(args, "tasks", ["sst2", "agnews", "trec", "dbpedia"])
-    task_defs = [td for td in task_defs if td["name"] in active_tasks]
+    dataset_config = getattr(args, "dataset_config", build_dataset_config(args))
+
     tasks = []
-    for td in task_defs:
-        dm = data_modules[td["dm_key"]]
+    for task_name in active_tasks:
+        if task_name not in TASK_REGISTRY:
+            continue
+        num_classes, _ = TASK_REGISTRY[task_name]
+        dm = data_modules[task_name]
+        cfg = dataset_config[task_name]
+
+        train_dataset = TaskClassificationDataset(dm.train_ds, num_classes=num_classes)
+        hessian_dataset = train_dataset
+        hessian_num_samples = getattr(args, "nostalgia_num_samples", None)
+        if hessian_num_samples is not None:
+            hessian_num_samples = min(hessian_num_samples, len(hessian_dataset))
+            hessian_dataset = Subset(hessian_dataset, range(hessian_num_samples))
+
         tasks.append({
-            "name": td["name"],
+            "name": task_name,
             "train_ds": dm.train_ds,
-            "num_classes": td["num_classes"],
-            # Keep a pre-built loader for Hessian estimation (Phase 3)
+            "num_classes": num_classes,
             "loader": DataLoader(
-                TaskClassificationDataset(dm.train_ds, num_classes=td["num_classes"]),
-                batch_size=args.batch_size,
+                train_dataset,
+                batch_size=cfg["batch_size"],
+                shuffle=True,
+                pin_memory=(default_device.type == "cuda"),
+            ),
+            "hessian_loader": DataLoader(
+                hessian_dataset,
+                batch_size=cfg["batch_size"],
                 shuffle=True,
                 pin_memory=(default_device.type == "cuda"),
             ),
@@ -45,8 +79,8 @@ def build_tasks(args, data_modules, default_device):
     return tasks
 
 
-def build_val_dataloaders(tasks, data_modules, default_device, batch_size):
-    """Build validation DataLoaders for all tasks.
+def build_val_dataloaders(tasks, data_modules, default_device, dataset_config):
+    """Build validation DataLoaders for all tasks using per-task batch sizes.
 
     Returns:
         val_dataloaders: list of DataLoader
@@ -61,9 +95,10 @@ def build_val_dataloaders(tasks, data_modules, default_device, batch_size):
         if dm is None:
             continue
 
+        cfg = dataset_config[t_name]
         val_dataloaders.append(DataLoader(
             TaskClassificationDataset(dm.val_ds, num_classes=task["num_classes"]),
-            batch_size=batch_size,
+            batch_size=cfg["batch_size"],
             shuffle=False,
             pin_memory=(default_device.type != "mps"),
         ))
@@ -107,36 +142,26 @@ def run_sequential_pipeline(args):
 
     # 1. Setup Datasets
     print_global("Setting up datasets...", rank=local_rank)
-    dm_kwargs = dict(
-        model_name=args.model_name,
-        max_length=args.max_length,
-        batch_size=args.batch_size,
-        max_train_samples=args.max_train_samples,
-        max_val_samples=args.max_val_samples,
-    )
-
+    args.dataset_config = build_dataset_config(args)
     active_tasks = getattr(args, "tasks", ["sst2", "agnews", "trec", "dbpedia"])
+
     data_modules = {}
-    if "sst2" in active_tasks:
-        sst2_dm = SST2DataModule(**dm_kwargs)
-        sst2_dm.setup()
-        data_modules["sst2"] = sst2_dm
-    if "agnews" in active_tasks:
-        agnews_dm = AGNewsDataModule(**dm_kwargs)
-        agnews_dm.setup()
-        data_modules["agnews"] = agnews_dm
-    if "trec" in active_tasks:
-        trec_dm = TRECDataModule(**dm_kwargs)
-        trec_dm.setup()
-        data_modules["trec"] = trec_dm
-    if "dbpedia" in active_tasks:
-        dbpedia_dm = DBpediaDataModule(**dm_kwargs)
-        dbpedia_dm.setup()
-        data_modules["dbpedia"] = dbpedia_dm
+    for task_name in active_tasks:
+        num_classes, DMClass = TASK_REGISTRY[task_name]
+        cfg = args.dataset_config[task_name]
+        dm = DMClass(
+            model_name=args.model_name,
+            max_length=cfg["max_length"],
+            batch_size=cfg["batch_size"],
+            max_train_samples=cfg["max_train_samples"],
+            max_val_samples=cfg["max_val_samples"],
+        )
+        dm.setup()
+        data_modules[task_name] = dm
 
     tasks = build_tasks(args, data_modules, default_device)
     val_dataloaders, val_task_names = build_val_dataloaders(
-        tasks, data_modules, default_device, args.batch_size,
+        tasks, data_modules, default_device, args.dataset_config,
     )
     print_global("Datasets setup completed successfully.", rank=local_rank)
 
@@ -161,6 +186,10 @@ def run_sequential_pipeline(args):
         pooling=getattr(args, "pooling", "last"),
         run_debug_checks=getattr(args, "run_debug_checks", False),
         precision=args.precision,
+        base_optimizer_name=getattr(args, "base_optimizer", "adamw"),
+        sgd_momentum=getattr(args, "sgd_momentum", 0.9),
+        weight_decay=getattr(args, "weight_decay", 0.01),
+        log_every=getattr(args, "log_every_n_steps", 50),
     )
     if getattr(model, "writer", None) is not None:
         model.writer.model = model
@@ -173,6 +202,10 @@ def run_sequential_pipeline(args):
 
     # 3. Build schedule and single Trainer
     scheduler_callback = PhaseSchedulerCallback(tasks, args)
+    task_batch_sizes = {
+        name: cfg["batch_size"]
+        for name, cfg in args.dataset_config.items()
+    }
     data_module = SequentialTaskDataModule(
         tasks=tasks,
         val_dataloaders=val_dataloaders,
@@ -180,6 +213,7 @@ def run_sequential_pipeline(args):
         schedule=scheduler_callback.schedule,
         args=args,
         default_device=default_device,
+        task_batch_sizes=task_batch_sizes,
     )
 
     total_epochs = scheduler_callback.total_epochs

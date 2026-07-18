@@ -1,0 +1,9 @@
+torch>=2.0
+lightning>=2.0
+transformers>=4.35
+datasets>=2.14
+peft>=0.7
+bitsandbytes>=0.41
+wandb>=0.16
+tqdm
+# torch_xla  # uncomment / install on TPU hosts (e.g. `pip install torch_xla[tpu]`)

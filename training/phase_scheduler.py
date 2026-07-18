@@ -308,16 +308,19 @@ class PhaseSchedulerCallback(pl.Callback):
     def _run_hessian_estimation(self, pl_module, task_name, task_idx):
         device = pl_module.device
 
-        # Get the task's DataLoader from stored tasks list
+        # Prefer the dedicated Hessian loader if available, else fall back.
         loader = None
         for t in self.tasks:
             if t["name"] == task_name:
-                loader = t["loader"]
+                loader = t.get("hessian_loader", t["loader"])
                 break
 
         if loader is None:
             print(f"  WARNING: no loader found for task '{task_name}', skipping Phase 3")
             return
+
+        accumulation_rounds = getattr(self.args, "nostalgia_accumulation_rounds", 5)
+        max_hessian_batch = getattr(self.args, "nostalgia_max_hessian_batch", 8)
 
         old_active_task = pl_module.active_task
         old_logging_disabled = getattr(pl_module, "logging_disabled", False)
@@ -330,8 +333,8 @@ class PhaseSchedulerCallback(pl.Callback):
                 k=self.args.k,
                 device=device,
                 train_loader=loader,
-                accumulation_rounds=self.args.accumulation_rounds,
-                max_hessian_batch=8,
+                accumulation_rounds=accumulation_rounds,
+                max_hessian_batch=max_hessian_batch,
             )
 
             # CRITICAL: restore model to train mode after Hessian estimation

@@ -109,76 +109,90 @@ class NostalgiaOptimizer(Optimizer):
 
     # ------------------------------------------------------------------
     @torch.no_grad()
+    def _project_gradients(self) -> Optional[torch.Tensor]:
+        """
+        Project gradients onto the null-space of the remembered eigenspace:
+            g' = g - Q (Q^T g)
+        Writes the projected gradients back into parameter .grad fields and
+        returns the flattened original gradient (for logging).
+        """
+        if self.nostalgia_Q is None:
+            return None
+
+        flat_grads = self._flatten_grads()
+
+        if torch.isnan(flat_grads).any() or torch.isinf(flat_grads).any():
+            print("[NostalgiaOptimizer] WARNING: NaN/Inf in gradients, skipping projection")
+            return flat_grads
+
+        coeffs = self.nostalgia_Q.T @ flat_grads
+
+        if torch.isnan(coeffs).any() or torch.isinf(coeffs).any():
+            print("[NostalgiaOptimizer] WARNING: NaN/Inf in Q^T g coefficients, skipping projection")
+            return flat_grads
+
+        # Optional eigenvalue-aware scaling
+        if self.scaling is not None:
+            c_scaling = torch.median(self.scaling) + 1e-12
+            if self.scaling.ndim == 1:
+                coeffs = coeffs * (self.scaling / (c_scaling + self.scaling))
+            else:
+                coeffs = (self.scaling / (c_scaling + self.scaling)) @ coeffs
+
+        projection = self.nostalgia_Q @ coeffs
+
+        if torch.isnan(projection).any() or torch.isinf(projection).any():
+            print("[NostalgiaOptimizer] WARNING: NaN/Inf in projection, skipping")
+            return flat_grads
+
+        flat_grads_projected = flat_grads - projection
+
+        if torch.isnan(flat_grads_projected).any() or torch.isinf(flat_grads_projected).any():
+            print("[NostalgiaOptimizer] WARNING: NaN/Inf in projected gradients, skipping")
+            return flat_grads
+
+        self._unflatten_to_grads(flat_grads_projected)
+        return flat_grads
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
     def step(self, closure: Optional[Any] = None):  # type: ignore
-        # 1. Save parameter values before standard optimizer step
-        params_before = [p.detach().clone() for p in self.projection_params]
+        # Lightning passes a closure that computes the forward/backward pass.
+        # Run it first so the accumulated gradients in p.grad are up-to-date.
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
 
-        # 2. Execute base optimizer step (AdamW, etc.)
-        loss = self.base_optimizer.step(closure)
-
-        # 3. Apply projection to the actual parameter update if Q is injected
+        # Project raw gradients before the base optimizer consumes them.
+        flat_grads_before = None
         try:
-            if self.nostalgia_Q is not None:
-                updates = []
-                for p, p_before in zip(self.projection_params, params_before):
-                    updates.append((p - p_before).view(-1))
-                flat_updates = torch.cat(updates)
-
-                if torch.isnan(flat_updates).any() or torch.isinf(flat_updates).any():
-                    print("[NostalgiaOptimizer] WARNING: NaN/Inf in parameter updates, skipping projection")
-                    return loss
-
-                coeffs = self.nostalgia_Q.T @ flat_updates
-
-                if torch.isnan(coeffs).any() or torch.isinf(coeffs).any():
-                    print("[NostalgiaOptimizer] WARNING: NaN/Inf in coefficients, skipping projection")
-                    return loss
-
-                # Optional eigenvalue-aware scaling
-                if self.scaling is not None:
-                    c_scaling = torch.median(self.scaling) + 1e-12
-                    if self.scaling.ndim == 1:
-                        coeffs = coeffs * (self.scaling / (c_scaling + self.scaling))
-                    else:
-                        coeffs = (self.scaling / (c_scaling + self.scaling)) @ coeffs
-
-                projection = self.nostalgia_Q @ coeffs
-
-                if torch.isnan(projection).any() or torch.isinf(projection).any():
-                    print("[NostalgiaOptimizer] WARNING: NaN/Inf in projection, skipping")
-                    return loss
-
-                flat_updates_projected = flat_updates - projection
-
-                if torch.isnan(flat_updates_projected).any() or torch.isinf(flat_updates_projected).any():
-                    print("[NostalgiaOptimizer] WARNING: NaN/Inf in projected updates, skipping")
-                    return loss
-
-                # Write the projected parameters back
-                pointer = 0
-                for p, p_before, n in zip(self.projection_params, params_before, self.param_numels):
-                    update_slice = flat_updates_projected[pointer:pointer + n].view_as(p)
-                    p.copy_(p_before + update_slice)
-                    pointer += n
-
-                # Log projection ratio to wandb
-                if self.writter is not None and self.step_count % self.log_every == 0:
-                    ratio = (torch.norm(flat_updates_projected) / (torch.norm(flat_updates) + 1e-12)).item()
-                    if self.proj_ratio_ema is None:
-                        self.proj_ratio_ema = ratio
-                    else:
-                        self.proj_ratio_ema = self.ema_beta * self.proj_ratio_ema + (1 - self.ema_beta) * ratio
-
-                    self.writter.add_scalars('Nostalgia', {
-                        'Projection_Ratio': ratio,
-                        'Projection_Ratio_EMA': self.proj_ratio_ema,
-                    }, self.step_count)
-
+            flat_grads_before = self._project_gradients()
         except Exception as e:
-            print(f"[NostalgiaOptimizer] ERROR during projection step: {e}")
+            print(f"[NostalgiaOptimizer] ERROR during gradient projection: {e}")
 
-        finally:
-            self.step_count += 1
+        # Execute base optimizer step on the (possibly projected) gradients.
+        # Call without closure because we already executed it above.
+        loss_out = self.base_optimizer.step()
+        if loss is None:
+            loss = loss_out
+
+        # Log projection ratio to wandb.
+        if flat_grads_before is not None and self.nostalgia_Q is not None:
+            if self.writter is not None and self.step_count % self.log_every == 0:
+                flat_grads_after = self._flatten_grads()  # projected gradient currently in .grad
+                ratio = (torch.norm(flat_grads_after) / (torch.norm(flat_grads_before) + 1e-12)).item()
+                if self.proj_ratio_ema is None:
+                    self.proj_ratio_ema = ratio
+                else:
+                    self.proj_ratio_ema = self.ema_beta * self.proj_ratio_ema + (1 - self.ema_beta) * ratio
+
+                self.writter.add_scalars('Nostalgia', {
+                    'Projection_Ratio': ratio,
+                    'Projection_Ratio_EMA': self.proj_ratio_ema,
+                }, self.step_count)
+
+        self.step_count += 1
         return loss
 
     # ------------------------------------------------------------------

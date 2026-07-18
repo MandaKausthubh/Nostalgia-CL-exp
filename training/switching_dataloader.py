@@ -55,19 +55,33 @@ class DynamicTaskDataLoader(DataLoader):
 class SequentialTaskDataModule(pl.LightningDataModule):
     """Returns the correct task DataLoader based on the epoch schedule."""
 
-    def __init__(self, tasks, val_dataloaders, val_task_names, schedule, args, default_device):
+    def __init__(
+        self,
+        tasks,
+        val_dataloaders,
+        val_task_names,
+        schedule,
+        args,
+        default_device,
+        task_batch_sizes=None,
+    ):
         super().__init__()
         self.schedule = schedule
         self.val_dataloaders_list = val_dataloaders
         self.val_task_names = val_task_names
         self.active_task_name = None
 
+        if task_batch_sizes is None:
+            task_batch_sizes = {}
+
         # Pre-build a DataLoader per task (keyed by task name)
         self.task_loaders = {}
         for task in tasks:
-            self.task_loaders[task["name"]] = DataLoader(
+            task_name = task["name"]
+            batch_size = task_batch_sizes.get(task_name, getattr(args, "batch_size", 8))
+            self.task_loaders[task_name] = DataLoader(
                 TaskClassificationDataset(task["train_ds"], num_classes=task["num_classes"]),
-                batch_size=args.batch_size,
+                batch_size=batch_size,
                 shuffle=True,
                 pin_memory=(default_device.type == "cuda"),
             )
