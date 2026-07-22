@@ -89,7 +89,13 @@ for task in Tasks:
 
 ## Implementation Plan:
 
+## Comparison Baselines
+3 continual-learning baselines compared against Nostalgia:
+- **GPM** (Gradient Projection Memory) — same null-space projection family, gradient-based subspace. Direct competitor.
+- **EWC** (Elastic Weight Consolidation) — Fisher-diagonal regularization penalty. Classic baseline.
+- **A-GEM** (Average Gradient Episodic Memory) — replay buffer with gradient angle projection. Memory-based baseline.
 
-
-
-
+Implemented in `baselines/` package. Selected via `--method {nostalgia,naive_adam,ewc,gpm,agem}`.
+GPM reuses the Nostalgia projection wrapper; only Q construction differs.
+EWC and A-GEM add their own optimizer wrappers (parallel to NostalgiaOptimizer).
+Per-task state (Fisher / replay buffer / subspace) computed in PhaseSchedulerCallback.on_train_epoch_end.

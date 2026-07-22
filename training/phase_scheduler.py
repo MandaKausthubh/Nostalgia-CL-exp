@@ -32,6 +32,9 @@ except ImportError:
 from utils.hessians import compute_single_domain_eigenspace
 from utils.accumulate import accumulate_hessian_eigenspace_stable
 from utils.TPU import broadcast_Q_Lambda
+from baselines.ewc import compute_fisher_diagonal, snapshot_theta_star
+from baselines.gpm import compute_gpm_subspace
+from baselines.agem import fill_replay_buffer
 
 
 class PhaseSchedulerCallback(pl.Callback):
@@ -64,6 +67,11 @@ class PhaseSchedulerCallback(pl.Callback):
         # Accumulated Hessian eigenspace
         self.Q_memory = None
         self.Lambda_memory = None
+
+        # Baseline state (EWC / A-GEM) — parallel to Q_memory for Nostalgia/GPM
+        self.fisher_memory = None          # dict {id(p): tensor}
+        self.theta_star_memory = None      # dict {id(p): tensor}
+        self.replay_buffer = None           # baselines.agem.ReplayBuffer
 
     # ------------------------------------------------------------------
     # Batch start: sanity-check that the correct task's data is served
@@ -171,12 +179,25 @@ class PhaseSchedulerCallback(pl.Callback):
             trainer.accumulate_grad_batches = getattr(self.args, "accumulate_grad_batches", 1)
 
             # Attach Q_memory for NostalgiaOptimizer (skip for naive_adam)
-            if self.method == "nostalgia":
+            if self.method in ("nostalgia", "gpm"):
                 if self.Q_memory is not None and trainer.is_global_zero:
                     print(f"  Attaching nostalgia projection Q of shape "
                           f"{list(self.Q_memory.shape)}", flush=True)
                 pl_module.Q_memory = self.Q_memory
                 pl_module.Lambda_memory = self.Lambda_memory
+            elif self.method == "ewc":
+                # Hand Fisher + theta_star to the model so configure_optimizers can load them
+                pl_module.fisher_memory = self.fisher_memory
+                pl_module.theta_star_memory = self.theta_star_memory
+                if self.fisher_memory is not None and trainer.is_global_zero:
+                    print(f"  Attaching EWC fisher for "
+                          f"{len(self.fisher_memory)} params, lam={getattr(self.args, 'ewc_lambda', 400.0)}",
+                          flush=True)
+            elif self.method == "agem":
+                pl_module.replay_buffer = self.replay_buffer
+                if self.replay_buffer is not None and trainer.is_global_zero:
+                    print(f"  Attaching A-GEM replay buffer with "
+                          f"{len(self.replay_buffer)} examples", flush=True)
 
         if trainer.is_global_zero:
             print(f"  grad_clip_val={trainer.gradient_clip_val}, "
@@ -289,23 +310,23 @@ class PhaseSchedulerCallback(pl.Callback):
         # Mark task as completed
         pl_module.completed_tasks.add(task_name)
 
-        # Skip Hessian estimation for naive_adam baseline
-        if self.method != "nostalgia":
+        # Skip task-end estimation for naive_adam baseline (no state to collect)
+        if self.method == "naive_adam":
             if trainer.is_global_zero:
                 print(f"  [Phase 3] Skipped (method={self.method})")
             return
 
         if trainer.is_global_zero:
-            print(f"\n[Phase 3] Estimating Hessian eigenspace for '{task_name}'...",
-                  flush=True)
+            print(f"\n[Phase 3] Running task-end estimation for '{task_name}' "
+                  f"(method={self.method})...", flush=True)
 
-        # --- Hessian estimation ---
-        self._run_hessian_estimation(pl_module, task_name, task_idx)
+        # --- Dispatch by method ---
+        self._run_task_end_estimation(pl_module, task_name, task_idx)
 
     # ------------------------------------------------------------------
-    # Hessian estimation (Phase 3) — runs on all ranks
+    # Task-end estimation (Phase 3) — runs on all ranks
     # ------------------------------------------------------------------
-    def _run_hessian_estimation(self, pl_module, task_name, task_idx):
+    def _run_task_end_estimation(self, pl_module, task_name, task_idx):
         device = pl_module.device
 
         # Prefer the dedicated Hessian loader if available, else fall back.
@@ -319,63 +340,138 @@ class PhaseSchedulerCallback(pl.Callback):
             print(f"  WARNING: no loader found for task '{task_name}', skipping Phase 3")
             return
 
-        accumulation_rounds = getattr(self.args, "nostalgia_accumulation_rounds", 5)
-        max_hessian_batch = getattr(self.args, "nostalgia_max_hessian_batch", 8)
-
         old_active_task = pl_module.active_task
         old_logging_disabled = getattr(pl_module, "logging_disabled", False)
         pl_module.active_task = task_name
         pl_module.logging_disabled = True
 
         try:
-            Q_new, Lambda_new = compute_single_domain_eigenspace(
-                model=pl_module,
-                k=self.args.k,
-                device=device,
-                train_loader=loader,
-                accumulation_rounds=accumulation_rounds,
-                max_hessian_batch=max_hessian_batch,
-            )
-
-            # CRITICAL: restore model to train mode after Hessian estimation
-            pl_module.train()
-
-            print(f"  Computed task Q shape: {list(Q_new.shape)}, "
-                  f"Lambda shape: {list(Lambda_new.shape)}")
-
-            _flush_memory(device)
-
-            self.Q_memory, self.Lambda_memory = accumulate_hessian_eigenspace_stable(
-                Q_old=self.Q_memory,
-                Lambda_old=self.Lambda_memory,
-                Q_new=Q_new,
-                Lambda_new=Lambda_new,
-                t=task_idx+1,
-                k=self.args.k,
-            )
-            print(f"  Accumulated Q memory shape: {list(self.Q_memory.shape)}, "
-                  f"Lambda memory shape: {list(self.Lambda_memory.shape)}")
-
-            del Q_new, Lambda_new
-            _flush_memory(device)
-
-            # Broadcast across TPU replicas
-            self.Q_memory, self.Lambda_memory = broadcast_Q_Lambda(
-                self.Q_memory, self.Lambda_memory
-            )
-
+            if self.method == "nostalgia":
+                self._estimate_nostalgia(pl_module, loader, task_idx, device)
+            elif self.method == "gpm":
+                self._estimate_gpm(pl_module, loader, device)
+            elif self.method == "ewc":
+                self._estimate_ewc(pl_module, loader, device)
+            elif self.method == "agem":
+                self._estimate_agem(pl_module, loader, task_name)
+            else:
+                print(f"  [Phase 3] No estimation defined for method={self.method}")
         except Exception as e:
-            # Don't let Hessian estimation crash the entire training run.
-            # If it fails, we simply skip projection for this task.
             import traceback
-            print(f"  ERROR in Hessian estimation for '{task_name}': {e}")
+            print(f"  ERROR in task-end estimation for '{task_name}' (method={self.method}): {e}")
             traceback.print_exc()
-            print(f"  Continuing without updating projection space.")
+            print(f"  Continuing without updating state.")
             _flush_memory(device)
         finally:
             pl_module.active_task = old_active_task
             pl_module.logging_disabled = old_logging_disabled
             pl_module.train()
+
+    # ------------------------------------------------------------------
+    # Per-method estimators
+    # ------------------------------------------------------------------
+    def _estimate_nostalgia(self, pl_module, loader, task_idx, device):
+        accumulation_rounds = getattr(self.args, "nostalgia_accumulation_rounds", 5)
+        max_hessian_batch = getattr(self.args, "nostalgia_max_hessian_batch", 8)
+
+        Q_new, Lambda_new = compute_single_domain_eigenspace(
+            model=pl_module,
+            k=self.args.k,
+            device=device,
+            train_loader=loader,
+            accumulation_rounds=accumulation_rounds,
+            max_hessian_batch=max_hessian_batch,
+        )
+        pl_module.train()
+        print(f"  Computed task Q shape: {list(Q_new.shape)}, "
+              f"Lambda shape: {list(Lambda_new.shape)}")
+        _flush_memory(device)
+
+        self.Q_memory, self.Lambda_memory = accumulate_hessian_eigenspace_stable(
+            Q_old=self.Q_memory,
+            Lambda_old=self.Lambda_memory,
+            Q_new=Q_new,
+            Lambda_new=Lambda_new,
+            t=task_idx + 1,
+            k=self.args.k,
+        )
+        print(f"  Accumulated Q memory shape: {list(self.Q_memory.shape)}, "
+              f"Lambda memory shape: {list(self.Lambda_memory.shape)}")
+        del Q_new, Lambda_new
+        _flush_memory(device)
+        self.Q_memory, self.Lambda_memory = broadcast_Q_Lambda(
+            self.Q_memory, self.Lambda_memory
+        )
+
+    def _estimate_gpm(self, pl_module, loader, device):
+        threshold = getattr(self.args, "gpm_threshold", 0.925)
+        task_idx = self._task_index(pl_module.active_task)
+
+        Q_new, Lambda_new = compute_gpm_subspace(
+            model=pl_module,
+            loader=loader,
+            device=device,
+            threshold=threshold,
+            k=self.args.k,
+        )
+        pl_module.train()
+        print(f"  GPM task Q shape: {list(Q_new.shape)}, "
+              f"Lambda shape: {list(Lambda_new.shape)}")
+        _flush_memory(device)
+
+        # Reuse the same stable accumulator (same Q/Lambda shape contract)
+        self.Q_memory, self.Lambda_memory = accumulate_hessian_eigenspace_stable(
+            Q_old=self.Q_memory,
+            Lambda_old=self.Lambda_memory,
+            Q_new=Q_new,
+            Lambda_new=Lambda_new,
+            t=task_idx + 1,
+            k=self.args.k,
+        )
+        print(f"  Accumulated GPM Q memory shape: {list(self.Q_memory.shape)}, "
+              f"Lambda memory shape: {list(self.Lambda_memory.shape)}")
+        del Q_new, Lambda_new
+        _flush_memory(device)
+        try:
+            self.Q_memory, self.Lambda_memory = broadcast_Q_Lambda(
+                self.Q_memory, self.Lambda_memory
+            )
+        except Exception as e:
+            print(f"  [GPM] broadcast_Q_Lambda skipped: {e}")
+
+    def _estimate_ewc(self, pl_module, loader, device):
+        # Empirical Fisher diagonal + snapshot current backbone params as theta_star.
+        fisher = compute_fisher_diagonal(pl_module, loader, device)
+        theta_star = snapshot_theta_star(pl_module, device)
+        # Merge: accumulate Fisher across tasks (A-GEM-style: keep per-task and let
+        # EWC penalty use the union). For simplicity we keep the latest task's Fisher
+        # as the active penalty anchor; a running average could be added later.
+        self.fisher_memory = fisher
+        self.theta_star_memory = theta_star
+        print(f"  EWC fisher snapshot for {len(fisher)} backbone params, "
+              f"lam={getattr(self.args, 'ewc_lambda', 400.0)}")
+        _flush_memory(device)
+
+    def _estimate_agem(self, pl_module, loader, task_name):
+        mem_size = getattr(self.args, "agem_mem_size", 500)
+        # Build (or extend) the replay buffer with examples from this task.
+        new_buf = fill_replay_buffer(pl_module, loader, mem_size, task_name)
+        if self.replay_buffer is None:
+            self.replay_buffer = new_buf
+        else:
+            # Merge: append new task's examples into the existing buffer (ring replacement)
+            for i in range(len(new_buf)):
+                ii, am, lb, tk = new_buf._store[i]
+                self.replay_buffer.add(ii, am, lb, tk)
+        print(f"  A-GEM replay buffer size: {len(self.replay_buffer)}/{self.replay_buffer.capacity}")
+        _flush_memory(pl_module.device)
+
+    def _task_index(self, task_name):
+        """Return 0-based index of a task name in the schedule's task list."""
+        for i, t in enumerate(self.tasks):
+            if t["name"] == task_name:
+                return i
+        return 0
 
 
 def _flush_memory(device):

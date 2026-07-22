@@ -190,6 +190,9 @@ def run_sequential_pipeline(args):
         sgd_momentum=getattr(args, "sgd_momentum", 0.9),
         weight_decay=getattr(args, "weight_decay", 0.01),
         log_every=getattr(args, "log_every_n_steps", 50),
+        ewc_lambda=getattr(args, "ewc_lambda", 400.0),
+        agem_mem_size=getattr(args, "agem_mem_size", 500),
+        gpm_threshold=getattr(args, "gpm_threshold", 0.925),
     )
     if getattr(model, "writer", None) is not None:
         model.writer.model = model

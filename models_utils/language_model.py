@@ -431,7 +431,34 @@ class LanguageModelModule(pl.LightningModule):
             self._val_preds.clear()
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=0.01)
+        head_lr = self.hparams.head_lr if getattr(self.hparams, "head_lr", None) is not None else self.hparams.lr
+        weight_decay = getattr(self.hparams, "weight_decay", 0.01)
+
+        # Split parameters into backbone and head groups
+        backbone_params = [p for p in self.backbone.parameters() if p.requires_grad]
+        backbone_param_ids = {id(p) for p in backbone_params}
+
+        # Head params: anything requiring grad that isn't in the backbone
+        head_params = [p for p in self.parameters() if p.requires_grad and id(p) not in backbone_param_ids]
+
+        param_groups = []
+        if backbone_params:
+            param_groups.append({
+                "params": backbone_params,
+                "lr": self.hparams.lr,
+                "weight_decay": weight_decay,
+            })
+        if head_params:
+            param_groups.append({
+                "params": head_params,
+                "lr": head_lr,
+                "weight_decay": weight_decay,
+            })
+
+        if not param_groups:
+            param_groups = [{"params": [p for p in self.parameters() if p.requires_grad]}]
+
+        opt = torch.optim.AdamW(param_groups, lr=self.hparams.lr, weight_decay=weight_decay)
         scheduler = get_linear_schedule_with_warmup(
             opt,
             num_warmup_steps=self.hparams.warmup_steps,

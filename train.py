@@ -94,7 +94,7 @@ def parse_args():
         "--method",
         type=str,
         default="nostalgia",
-        choices=["nostalgia", "naive_adam"],
+        choices=["nostalgia", "naive_adam", "ewc", "gpm", "agem"],
     )
     nostalgia_group.add_argument("--k", type=int, default=20)
     nostalgia_group.add_argument("--nostalgia_accumulation_rounds", type=int, default=5)
@@ -105,6 +105,13 @@ def parse_args():
         default=None,
         help="Max number of training samples used for Hessian estimation per task",
     )
+    # Baseline hyperparameters
+    nostalgia_group.add_argument("--ewc_lambda", type=float, default=400.0,
+                                 help="EWC regularization strength (lam)")
+    nostalgia_group.add_argument("--agem_mem_size", type=int, default=500,
+                                 help="A-GEM replay buffer capacity (examples)")
+    nostalgia_group.add_argument("--gpm_threshold", type=float, default=0.925,
+                                 help="GPM relative singular-value threshold for subspace retention")
 
     # Validation / logging
     log_group = parser.add_argument_group("Validation / logging")

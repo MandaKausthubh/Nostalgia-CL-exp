@@ -3,6 +3,10 @@ import lightning.pytorch as pl
 from transformers import get_linear_schedule_with_warmup
 from models_utils.language_model import LanguageModelModule
 from utils.nostalgia import NostalgiaOptimizer
+from baselines import get_baseline, is_baseline
+from baselines.ewc import EWCOptimizer
+from baselines.agem import AGEMOptimizer
+
 
 class NostalgiaLanguageModelModule(LanguageModelModule):
     def __init__(
@@ -27,6 +31,9 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
         base_optimizer_name="adamw",
         sgd_momentum=0.9,
         weight_decay=0.01,
+        ewc_lambda=400.0,
+        agem_mem_size=500,
+        gpm_threshold=0.925,
     ):
         super().__init__(
             model_name=model_name,
@@ -51,6 +58,16 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
         self.base_optimizer_name = base_optimizer_name
         self.sgd_momentum = sgd_momentum
         self.weight_decay = weight_decay
+        self.ewc_lambda = ewc_lambda
+        self.agem_mem_size = agem_mem_size
+        self.gpm_threshold = gpm_threshold
+
+        # Per-task baseline state (populated by PhaseSchedulerCallback)
+        # EWC: fisher + theta_star dicts keyed by id(p)
+        # A-GEM: ReplayBuffer
+        self.fisher_memory = None
+        self.theta_star_memory = None
+        self.replay_buffer = None
 
     def _build_base_optimizer(self, param_groups):
         """Instantiate the requested base optimizer."""
@@ -98,8 +115,8 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
         if self.training_phase == "head_align" or self.method == "naive_adam":
             # Phase 1 and naive_adam baseline use the chosen base optimizer directly.
             optimizer = self._build_base_optimizer(param_groups)
-        else:
-            # Phase 2 with Nostalgia projection
+        elif self.method == "nostalgia" or self.method == "gpm":
+            # Phase 2 with Nostalgia/GPM projection (same wrapper; Q source differs).
             base_optimizer = self._build_base_optimizer(param_groups)
 
             proj_params = [p for p in self.backbone.parameters() if p.requires_grad]
@@ -116,6 +133,39 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
             # Load accumulated projection space if available
             if getattr(self, "Q_memory", None) is not None:
                 optimizer.set_Q(self.Q_memory, self.Lambda_memory)
+        elif self.method == "ewc":
+            base_optimizer = self._build_base_optimizer(param_groups)
+            proj_params = [p for p in self.backbone.parameters() if p.requires_grad]
+            optimizer = EWCOptimizer(
+                params=proj_params,
+                base_optimizer=base_optimizer,
+                device=self.device,
+                dtype=next(self.parameters()).dtype,
+                fisher=self.fisher_memory,
+                theta_star=self.theta_star_memory,
+                lam=self.ewc_lambda,
+                writer=self.writer,
+                log_every=self.log_every,
+                starting_step=self.global_step_counter,
+            )
+        elif self.method == "agem":
+            base_optimizer = self._build_base_optimizer(param_groups)
+            proj_params = [p for p in self.backbone.parameters() if p.requires_grad]
+            optimizer = AGEMOptimizer(
+                params=proj_params,
+                base_optimizer=base_optimizer,
+                device=self.device,
+                dtype=next(self.parameters()).dtype,
+                replay_buffer=self.replay_buffer,
+                replay_bs=min(self.agem_mem_size, 8),
+                writer=self.writer,
+                log_every=self.log_every,
+                starting_step=self.global_step_counter,
+            )
+            # Give the optimizer a reference to the model so it can run replay forward passes
+            optimizer.set_model_ref(self)
+        else:
+            raise ValueError(f"Unknown method: {self.method}")
 
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
