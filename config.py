@@ -14,10 +14,17 @@ from datasets_utils.base_class import BaseTextDataModule
 
 
 def _has_xla_runtime() -> bool:
-    """Return True if torch_xla is available and an XLA device is present."""
+    """Return True if torch_xla is importable.
+
+    NOTE: do NOT call `xm.xla_device()` or `xm.xla_device_hw()` here — both
+    initialize the XLA runtime, which forbids a later `xmp.spawn` (PJRT raises
+    "Runtime is already initialized"). Lightning's XLA strategy owns spawn;
+    host-side code must stay on CPU and let Lightning place tensors on XLA
+    inside the spawned processes.
+    """
     try:
-        import torch_xla.core.xla_model as xm
-        return xm.xla_device_hw() is not None
+        import torch_xla  # noqa: F401
+        return True
     except Exception:
         return False
 
@@ -41,8 +48,11 @@ def resolve_device_and_quantization(args: Any) -> Tuple[torch.device, Optional[s
     accelerator = getattr(args, "accelerator", None)
 
     if accelerator == "tpu" or _has_xla_runtime():
-        import torch_xla.core.xla_model as xm
-        default_device = xm.xla_device()
+        # XLA detected. Return CPU for host-side decisions (pin_memory etc.).
+        # Calling xm.xla_device() here initializes the XLA runtime and breaks
+        # the later xmp.spawn() (PJRT: "Runtime is already initialized").
+        # Lightning's XLA strategy moves the model to XLA inside spawn.
+        default_device = torch.device("cpu")
     elif accelerator == "cuda":
         default_device = torch.device("cuda")
     elif accelerator == "mps":
@@ -67,7 +77,7 @@ def resolve_device_and_quantization(args: Any) -> Tuple[torch.device, Optional[s
             f"quantization must be None, '4bit', or '8bit'; got {quantization!r}"
         )
 
-    if quantization in ("4bit", "8bit") and default_device.type in ("xla",):
+    if quantization in ("4bit", "8bit") and _has_xla_runtime():
         raise ValueError(
             "BitsAndBytes quantization is not compatible with TPU / XLA."
         )
