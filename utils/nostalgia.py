@@ -21,6 +21,7 @@ class NostalgiaOptimizer(Optimizer):
         writter: Optional[Any] = None,
         starting_step: int = 0,
         log_every: int = 50,
+        alpha: float = 1.0,
     ):
         super().__init__(params, {})  # Dummy call to satisfy Optimizer base class
         self.base_optimizer = base_optimizer
@@ -34,6 +35,7 @@ class NostalgiaOptimizer(Optimizer):
         self.scaling: Optional[torch.Tensor] = None
         self.writter = writter
 
+        self.alpha = alpha
         self.log_every = log_every
         self.ema_beta = 0.98
         self.proj_ratio_ema: Optional[float] = None
@@ -112,7 +114,8 @@ class NostalgiaOptimizer(Optimizer):
     def _project_gradients(self) -> Optional[torch.Tensor]:
         """
         Project gradients onto the null-space of the remembered eigenspace:
-            g' = g - Q (Q^T g)
+            g' = g - alpha * Q (Q^T g)
+        alpha=1.0 is hard null-space projection; alpha<1.0 softens plasticity loss.
         Writes the projected gradients back into parameter .grad fields and
         returns the flattened original gradient (for logging).
         """
@@ -139,7 +142,7 @@ class NostalgiaOptimizer(Optimizer):
             else:
                 coeffs = (self.scaling / (c_scaling + self.scaling)) @ coeffs
 
-        projection = self.nostalgia_Q @ coeffs
+        projection = self.alpha * (self.nostalgia_Q @ coeffs)
 
         if torch.isnan(projection).any() or torch.isinf(projection).any():
             print("[NostalgiaOptimizer] WARNING: NaN/Inf in projection, skipping")

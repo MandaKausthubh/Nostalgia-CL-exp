@@ -6,4 +6,6 @@ peft>=0.7
 bitsandbytes>=0.41
 wandb>=0.16
 tqdm
+torchvision
+Pillow
 # torch_xla  # uncomment / install on TPU hosts (e.g. `pip install torch_xla[tpu]`)

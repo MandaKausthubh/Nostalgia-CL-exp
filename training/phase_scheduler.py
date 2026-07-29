@@ -68,10 +68,11 @@ class PhaseSchedulerCallback(pl.Callback):
         self.Q_memory = None
         self.Lambda_memory = None
 
-        # Baseline state (EWC / A-GEM) — parallel to Q_memory for Nostalgia/GPM
+        # Baseline state (EWC / A-GEM / SDFT) — parallel to Q_memory for Nostalgia/GPM
         self.fisher_memory = None          # dict {id(p): tensor}
         self.theta_star_memory = None      # dict {id(p): tensor}
         self.replay_buffer = None           # baselines.agem.ReplayBuffer
+        self.teacher_memory = None          # frozen teacher model for SDFT
 
     # ------------------------------------------------------------------
     # Batch start: sanity-check that the correct task's data is served
@@ -193,11 +194,25 @@ class PhaseSchedulerCallback(pl.Callback):
                     print(f"  Attaching EWC fisher for "
                           f"{len(self.fisher_memory)} params, lam={getattr(self.args, 'ewc_lambda', 400.0)}",
                           flush=True)
+            elif self.method == "ewc_nostalgia":
+                # Hand accumulated Q/Lambda + theta_star to the model
+                pl_module.Q_memory = self.Q_memory
+                pl_module.Lambda_memory = self.Lambda_memory
+                pl_module.theta_star_memory = self.theta_star_memory
+                if self.Q_memory is not None and trainer.is_global_zero:
+                    print(f"  Attaching EWC+Nostalgia Q of shape "
+                          f"{list(self.Q_memory.shape)}, "
+                          f"lam={getattr(self.args, 'ewc_nostalgia_lambda', 400.0)}",
+                          flush=True)
             elif self.method == "agem":
                 pl_module.replay_buffer = self.replay_buffer
                 if self.replay_buffer is not None and trainer.is_global_zero:
                     print(f"  Attaching A-GEM replay buffer with "
                           f"{len(self.replay_buffer)} examples", flush=True)
+            elif self.method == "sdft":
+                pl_module.teacher_model = self.teacher_memory
+                if self.teacher_memory is not None and trainer.is_global_zero:
+                    print(f"  Attaching SDFT teacher model", flush=True)
 
         if trainer.is_global_zero:
             print(f"  grad_clip_val={trainer.gradient_clip_val}, "
@@ -316,6 +331,12 @@ class PhaseSchedulerCallback(pl.Callback):
                 print(f"  [Phase 3] Skipped (method={self.method})")
             return
 
+        # Final task has no future task to protect against; skip expensive estimation.
+        if is_last:
+            if trainer.is_global_zero:
+                print(f"\n[Phase 3] Skipped for last task '{task_name}' (method={self.method}) — no future training")
+            return
+
         if trainer.is_global_zero:
             print(f"\n[Phase 3] Running task-end estimation for '{task_name}' "
                   f"(method={self.method})...", flush=True)
@@ -352,8 +373,12 @@ class PhaseSchedulerCallback(pl.Callback):
                 self._estimate_gpm(pl_module, loader, device)
             elif self.method == "ewc":
                 self._estimate_ewc(pl_module, loader, device)
+            elif self.method == "ewc_nostalgia":
+                self._estimate_ewc_nostalgia(pl_module, loader, task_idx, device)
             elif self.method == "agem":
                 self._estimate_agem(pl_module, loader, task_name)
+            elif self.method == "sdft":
+                self._estimate_sdft(pl_module, task_name)
             else:
                 print(f"  [Phase 3] No estimation defined for method={self.method}")
         except Exception as e:
@@ -452,6 +477,17 @@ class PhaseSchedulerCallback(pl.Callback):
               f"lam={getattr(self.args, 'ewc_lambda', 400.0)}")
         _flush_memory(device)
 
+    def _estimate_ewc_nostalgia(self, pl_module, loader, task_idx, device):
+        # Same Q/Lambda accumulation as Nostalgia, but also snapshot theta_star.
+        self._estimate_nostalgia(pl_module, loader, task_idx, device)
+        # theta_star = current backbone params after task training.
+        from baselines.ewc import snapshot_theta_star
+        self.theta_star_memory = snapshot_theta_star(pl_module, device)
+        print(f"  EWC+Nostalgia theta_star snapshot for "
+              f"{len(self.theta_star_memory)} backbone params, "
+              f"lam={getattr(self.args, 'ewc_nostalgia_lambda', 400.0)}")
+        _flush_memory(device)
+
     def _estimate_agem(self, pl_module, loader, task_name):
         mem_size = getattr(self.args, "agem_mem_size", 500)
         # Build (or extend) the replay buffer with examples from this task.
@@ -465,6 +501,16 @@ class PhaseSchedulerCallback(pl.Callback):
                 self.replay_buffer.add(ii, am, lb, tk)
         print(f"  A-GEM replay buffer size: {len(self.replay_buffer)}/{self.replay_buffer.capacity}")
         _flush_memory(pl_module.device)
+
+    def _estimate_sdft(self, pl_module, task_name):
+        """Snapshot the current model as the teacher for the next task."""
+        pl_module.snapshot_teacher()
+        self.teacher_memory = pl_module.teacher_model
+        if pl_module.device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif pl_module.device.type == "mps":
+            torch.mps.empty_cache()
+        print(f"  SDFT teacher snapshot for task '{task_name}' completed")
 
     def _task_index(self, task_name):
         """Return 0-based index of a task name in the schedule's task list."""

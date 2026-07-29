@@ -5,6 +5,7 @@ from models_utils.language_model import LanguageModelModule
 from utils.nostalgia import NostalgiaOptimizer
 from baselines import get_baseline, is_baseline
 from baselines.ewc import EWCOptimizer
+from baselines.ewc_nostalgia import EWCNostalgiaOptimizer
 from baselines.agem import AGEMOptimizer
 
 
@@ -32,8 +33,10 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
         sgd_momentum=0.9,
         weight_decay=0.01,
         ewc_lambda=400.0,
+        ewc_nostalgia_lambda=400.0,
         agem_mem_size=500,
         gpm_threshold=0.925,
+        nostalgia_alpha=1.0,
     ):
         super().__init__(
             model_name=model_name,
@@ -59,12 +62,17 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
         self.sgd_momentum = sgd_momentum
         self.weight_decay = weight_decay
         self.ewc_lambda = ewc_lambda
+        self.ewc_nostalgia_lambda = ewc_nostalgia_lambda
         self.agem_mem_size = agem_mem_size
         self.gpm_threshold = gpm_threshold
+        self.nostalgia_alpha = nostalgia_alpha
 
         # Per-task baseline state (populated by PhaseSchedulerCallback)
         # EWC: fisher + theta_star dicts keyed by id(p)
+        # Nostalgia/GPM/EWC+Nostalgia: Q/Lambda + theta_star
         # A-GEM: ReplayBuffer
+        self.Q_memory = None
+        self.Lambda_memory = None
         self.fisher_memory = None
         self.theta_star_memory = None
         self.replay_buffer = None
@@ -128,6 +136,7 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
                 writter=self.writer,
                 starting_step=self.global_step_counter,
                 log_every=self.log_every,
+                alpha=self.nostalgia_alpha,
             )
 
             # Load accumulated projection space if available
@@ -144,6 +153,22 @@ class NostalgiaLanguageModelModule(LanguageModelModule):
                 fisher=self.fisher_memory,
                 theta_star=self.theta_star_memory,
                 lam=self.ewc_lambda,
+                writer=self.writer,
+                log_every=self.log_every,
+                starting_step=self.global_step_counter,
+            )
+        elif self.method == "ewc_nostalgia":
+            base_optimizer = self._build_base_optimizer(param_groups)
+            proj_params = [p for p in self.backbone.parameters() if p.requires_grad]
+            optimizer = EWCNostalgiaOptimizer(
+                params=proj_params,
+                base_optimizer=base_optimizer,
+                device=self.device,
+                dtype=next(self.parameters()).dtype,
+                Q=self.Q_memory,
+                Lambda=self.Lambda_memory,
+                theta_star=self.theta_star_memory,
+                lam=self.ewc_nostalgia_lambda,
                 writer=self.writer,
                 log_every=self.log_every,
                 starting_step=self.global_step_counter,
