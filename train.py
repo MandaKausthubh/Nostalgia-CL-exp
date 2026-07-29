@@ -26,6 +26,11 @@ def parse_args():
     # Model
     model_group = parser.add_argument_group("Model")
     model_group.add_argument("--model_name", type=str, default="gpt2")
+    model_group.add_argument("--backbone", type=str, default="resnet10",
+                             choices=["resnet10", "resnet18", "vit", "siglip"],
+                             help="Image encoder backbone (only used for image tasks)")
+    model_group.add_argument("--image_size", type=int, default=None,
+                             help="Input image size (default: 32 for ResNets, 224 for ViT/SigLIP)")
     model_group.add_argument("--use_lora", action="store_true")
     model_group.add_argument("--lora_r", type=int, default=8)
     model_group.add_argument("--lora_alpha", type=int, default=16)
@@ -87,6 +92,12 @@ def parse_args():
         default=None,
         help='JSON string or path to JSON with per-task overrides. Example: \'{"sst2": {"batch_size": 4}}\'',
     )
+    data_group.add_argument("--data_root", type=str, default="./data",
+                            help="Root folder for datasets")
+    data_group.add_argument("--data_root_tinyimagenet", type=str, default=None,
+                            help="Folder containing tiny-imagenet-200 (overrides --data_root for tinyimg_* tasks)")
+    data_group.add_argument("--data_root_domainnet", type=str, default=None,
+                            help="Folder containing the domainnet directory (overrides --data_root for domainnet_* tasks)")
 
     # Nostalgia
     nostalgia_group = parser.add_argument_group("Nostalgia")
@@ -94,7 +105,7 @@ def parse_args():
         "--method",
         type=str,
         default="nostalgia",
-        choices=["nostalgia", "naive_adam", "ewc", "gpm", "agem", "ewc_nostalgia"],
+        choices=["nostalgia", "naive_adam", "ewc", "gpm", "agem", "ewc_nostalgia", "sdft"],
     )
     nostalgia_group.add_argument("--k", type=int, default=20)
     nostalgia_group.add_argument("--nostalgia_accumulation_rounds", type=int, default=5)
@@ -120,6 +131,10 @@ def parse_args():
                                  help="A-GEM replay buffer capacity (examples)")
     nostalgia_group.add_argument("--gpm_threshold", type=float, default=0.925,
                                  help="GPM relative singular-value threshold for subspace retention")
+    nostalgia_group.add_argument("--sdft_lambda_distillation", type=float, default=1.0,
+                                 help="SDFT distillation loss weight")
+    nostalgia_group.add_argument("--sdft_temperature", type=float, default=2.0,
+                                 help="SDFT distillation temperature")
 
     # Validation / logging
     log_group = parser.add_argument_group("Validation / logging")
@@ -153,6 +168,10 @@ def parse_args():
     # Validate dataset_overrides if provided
     if args.dataset_overrides is not None:
         _parse_dataset_overrides(args.dataset_overrides)
+
+    # Infer default image size from backbone for image tasks
+    if args.image_size is None:
+        args.image_size = 32 if args.backbone in ("resnet10", "resnet18") else 224
 
     # Default wandb name
     if args.wandb_project and args.wandb_name is None:

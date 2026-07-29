@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Grid benchmark script for the CNN CL pipeline.
-# Loops over backbones, benchmarks, and methods.
-# Usage:
-#   chmod +x run_cnn_benchmarks.sh
-#   ./run_cnn_benchmarks.sh
+# Image benchmark loop for the unified train.py pipeline.
 
-# ----------------------------- Configuration --------------------------------
 ACCEL="gpu"
 DEVICES="1"
 PH1="1"
@@ -28,7 +23,6 @@ BACKBONES=(
     "siglip:224"
 )
 
-# Each benchmark: name, list of two task names, number of classes per task.
 BENCHMARKS=(
     "cifar100_split:cifar100_t0 cifar100_t1"
     "tinyimagenet_split:tinyimg_t0 tinyimg_t1"
@@ -45,11 +39,9 @@ METHODS=(
     "sdft"
 )
 
-# Override data locations if available.
 DATA_ROOT_TINY="./data"
 DATA_ROOT_DN="./data"
 
-# ------------------------------- Helpers ------------------------------------
 run_exp() {
     local backbone_name="$1"
     local image_size="$2"
@@ -60,7 +52,6 @@ run_exp() {
 
     echo "====================================================================="
     echo "Running: backbone=$backbone_name  bench=$bench_name  method=$method"
-    echo "Task(s): $tasks"
     echo "====================================================================="
 
     local extra_args=""
@@ -79,7 +70,7 @@ run_exp() {
         root_override="--data_root_domainnet $DATA_ROOT_DN"
     fi
 
-    python testing/train_cnn.py \
+    python train.py \
         --backbone "$backbone_name" \
         --image_size "$image_size" \
         --tasks $tasks \
@@ -97,7 +88,7 @@ run_exp() {
         --data_root "$DATA_ROOT" \
         $root_override \
         $extra_args \
-        --wandb_project "cnn-cl-benchmarks" \
+        --wandb_project "image-cl-benchmarks" \
         --wandb_name "$exp_name"
 
     echo ""
@@ -105,7 +96,6 @@ run_exp() {
     echo ""
 }
 
-# ------------------------------- Main loop ----------------------------------
 for spec in "${BACKBONES[@]}"; do
     IFS=':' read -r backbone_name image_size <<< "$spec"
     for bench in "${BENCHMARKS[@]}"; do
@@ -116,4 +106,4 @@ for spec in "${BACKBONES[@]}"; do
     done
 done
 
-echo "All benchmark runs completed."
+echo "All image benchmark runs completed."

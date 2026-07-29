@@ -498,7 +498,14 @@
 
 
 from torch.func import functional_call
-from torch.nn.utils import parameters_to_vector
+from torch.nn.utils import parameters_to_vector as _torch_parameters_to_vector
+
+def parameters_to_vector(params):
+    """Reshape-safe version: torch's view(-1) fails on non-contiguous CNN double-backward grads."""
+    vec = []
+    for p in params:
+        vec.append(p.reshape(-1))
+    return torch.cat(vec)
 
 import math
 import gc

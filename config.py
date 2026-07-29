@@ -11,6 +11,7 @@ from datasets_utils.agnews_dataset import AGNewsDataModule
 from datasets_utils.trec_dataset import TRECDataModule
 from datasets_utils.dbpedia_dataset import DBpediaDataModule
 from datasets_utils.base_class import BaseTextDataModule
+from datasets_utils.image_datasets import IMAGE_TASK_REGISTRY
 
 
 def _has_xla_runtime() -> bool:
@@ -30,12 +31,15 @@ def _has_xla_runtime() -> bool:
 
 
 #: task_name -> (num_classes, DataModuleClass)
-TASK_REGISTRY: Dict[str, Tuple[int, Type[BaseTextDataModule]]] = {
+TEXT_TASK_REGISTRY: Dict[str, Tuple[int, Type[BaseTextDataModule]]] = {
     "sst2": (2, SST2DataModule),
     "agnews": (4, AGNewsDataModule),
     "trec": (6, TRECDataModule),
     "dbpedia": (14, DBpediaDataModule),
 }
+
+# Combined registry for the unified CLI.
+TASK_REGISTRY: Dict[str, Tuple[int, Type]] = {**TEXT_TASK_REGISTRY, **IMAGE_TASK_REGISTRY}
 
 
 def resolve_device_and_quantization(args: Any) -> Tuple[torch.device, Optional[str]]:

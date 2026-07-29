@@ -3,9 +3,10 @@ import os
 import wandb
 from torch.utils.data import DataLoader, Subset
 
-from config import resolve_device_and_quantization, TASK_REGISTRY
+from config import resolve_device_and_quantization, TASK_REGISTRY, TEXT_TASK_REGISTRY
 from datasets_utils.wrappers import TaskClassificationDataset
 from models_utils.nostalgia_optimizer import NostalgiaLanguageModelModule
+from models_utils.image_model import ImageModelModule
 from utils.logging import WandbSummaryWriterWrapper, NostalgiaWandbLogger
 
 import lightning.pytorch as pl
@@ -24,6 +25,10 @@ def _parse_dataset_overrides(value):
     return json.loads(value)
 
 
+def _is_image_task(task_name: str) -> bool:
+    return task_name not in TEXT_TASK_REGISTRY
+
+
 def build_dataset_config(args):
     """Build per-task dataset config, merging global args with overrides."""
     default = {
@@ -31,12 +36,19 @@ def build_dataset_config(args):
         "batch_size": args.batch_size,
         "max_train_samples": args.max_train_samples,
         "max_val_samples": args.max_val_samples,
+        "data_root": getattr(args, "data_root", "./data"),
     }
     overrides = _parse_dataset_overrides(getattr(args, "dataset_overrides", None))
-    return {
-        task_name: {**default, **overrides.get(task_name, {})}
-        for task_name in getattr(args, "tasks", ["sst2", "agnews", "trec", "dbpedia"])
-    }
+    cfg = {}
+    for task_name in getattr(args, "tasks", ["sst2", "agnews", "trec", "dbpedia"]):
+        task_cfg = {**default, **overrides.get(task_name, {})}
+        # Allow image benchmarks to live in separate folders.
+        if task_name.startswith("tinyimg_") and getattr(args, "data_root_tinyimagenet", None) is not None:
+            task_cfg["data_root"] = args.data_root_tinyimagenet
+        if task_name.startswith("domainnet_") and getattr(args, "data_root_domainnet", None) is not None:
+            task_cfg["data_root"] = args.data_root_domainnet
+        cfg[task_name] = task_cfg
+    return cfg
 
 
 def build_tasks(args, data_modules, default_device):
@@ -149,13 +161,22 @@ def run_sequential_pipeline(args):
     for task_name in active_tasks:
         num_classes, DMClass = TASK_REGISTRY[task_name]
         cfg = args.dataset_config[task_name]
-        dm = DMClass(
-            model_name=args.model_name,
-            max_length=cfg["max_length"],
-            batch_size=cfg["batch_size"],
-            max_train_samples=cfg["max_train_samples"],
-            max_val_samples=cfg["max_val_samples"],
-        )
+        if _is_image_task(task_name):
+            dm = DMClass(
+                batch_size=cfg["batch_size"],
+                max_train_samples=cfg["max_train_samples"],
+                max_val_samples=cfg["max_val_samples"],
+                image_size=getattr(args, "image_size", 32),
+                data_root=cfg["data_root"],
+            )
+        else:
+            dm = DMClass(
+                model_name=args.model_name,
+                max_length=cfg["max_length"],
+                batch_size=cfg["batch_size"],
+                max_train_samples=cfg["max_train_samples"],
+                max_val_samples=cfg["max_val_samples"],
+            )
         dm.setup()
         data_modules[task_name] = dm
 
@@ -169,33 +190,62 @@ def run_sequential_pipeline(args):
     tasks_config = {task["name"]: (task["num_classes"], args.head_layers) for task in tasks}
     print_global(f"Instantiating model with tasks: {tasks_config}...", rank=local_rank)
     print_global(f"Training method: {args.method}", rank=local_rank)
-    model = NostalgiaLanguageModelModule(
-        model_name=args.model_name,
-        lr=args.lr,
-        head_lr=args.head_lr,
-        warmup_steps=args.warmup_steps,
-        total_steps=args.total_steps,
-        tasks_config=tasks_config,
-        writer=WandbSummaryWriterWrapper(),
-        use_lora=args.use_lora,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        quantization=quantization,
-        method=args.method,
-        pooling=getattr(args, "pooling", "last"),
-        run_debug_checks=getattr(args, "run_debug_checks", False),
-        precision=args.precision,
-        base_optimizer_name=getattr(args, "base_optimizer", "adamw"),
-        sgd_momentum=getattr(args, "sgd_momentum", 0.9),
-        weight_decay=getattr(args, "weight_decay", 0.01),
-        log_every=getattr(args, "log_every_n_steps", 50),
-        ewc_lambda=getattr(args, "ewc_lambda", 400.0),
-        ewc_nostalgia_lambda=getattr(args, "ewc_nostalgia_lambda", 400.0),
-        agem_mem_size=getattr(args, "agem_mem_size", 500),
-        gpm_threshold=getattr(args, "gpm_threshold", 0.925),
-        nostalgia_alpha=getattr(args, "nostalgia_alpha", 1.0),
-    )
+
+    if active_tasks and _is_image_task(active_tasks[0]):
+        # Image pipeline
+        tasks_config = {task["name"]: task["num_classes"] for task in tasks}
+        model = ImageModelModule(
+            lr=args.lr,
+            head_lr=args.head_lr,
+            warmup_steps=args.warmup_steps,
+            total_steps=args.total_steps,
+            tasks_config=tasks_config,
+            writer=WandbSummaryWriterWrapper(),
+            method=args.method,
+            base_optimizer_name=getattr(args, "base_optimizer", "adamw"),
+            sgd_momentum=getattr(args, "sgd_momentum", 0.9),
+            weight_decay=getattr(args, "weight_decay", 0.01),
+            log_every=getattr(args, "log_every_n_steps", 50),
+            ewc_lambda=getattr(args, "ewc_lambda", 400.0),
+            ewc_nostalgia_lambda=getattr(args, "ewc_nostalgia_lambda", 400.0),
+            agem_mem_size=getattr(args, "agem_mem_size", 500),
+            gpm_threshold=getattr(args, "gpm_threshold", 0.925),
+            run_debug_checks=getattr(args, "run_debug_checks", False),
+            nostalgia_alpha=getattr(args, "nostalgia_alpha", 1.0),
+            backbone_name=getattr(args, "backbone", "resnet10"),
+            image_size=getattr(args, "image_size", 32),
+            sdft_lambda_distillation=getattr(args, "sdft_lambda_distillation", 1.0),
+            sdft_temperature=getattr(args, "sdft_temperature", 2.0),
+        )
+    else:
+        # Language model pipeline
+        model = NostalgiaLanguageModelModule(
+            model_name=args.model_name,
+            lr=args.lr,
+            head_lr=args.head_lr,
+            warmup_steps=args.warmup_steps,
+            total_steps=args.total_steps,
+            tasks_config=tasks_config,
+            writer=WandbSummaryWriterWrapper(),
+            use_lora=args.use_lora,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            quantization=quantization,
+            method=args.method,
+            pooling=getattr(args, "pooling", "last"),
+            run_debug_checks=getattr(args, "run_debug_checks", False),
+            precision=args.precision,
+            base_optimizer_name=getattr(args, "base_optimizer", "adamw"),
+            sgd_momentum=getattr(args, "sgd_momentum", 0.9),
+            weight_decay=getattr(args, "weight_decay", 0.01),
+            log_every=getattr(args, "log_every_n_steps", 50),
+            ewc_lambda=getattr(args, "ewc_lambda", 400.0),
+            ewc_nostalgia_lambda=getattr(args, "ewc_nostalgia_lambda", 400.0),
+            agem_mem_size=getattr(args, "agem_mem_size", 500),
+            gpm_threshold=getattr(args, "gpm_threshold", 0.925),
+            nostalgia_alpha=getattr(args, "nostalgia_alpha", 1.0),
+        )
     if getattr(model, "writer", None) is not None:
         model.writer.model = model
 
