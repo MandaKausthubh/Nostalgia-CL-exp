@@ -46,13 +46,13 @@ BENCHMARKS=(
 )
 
 METHODS=(
-    "nostalgia"
+    # "nostalgia"
     "naive_adam"
-    "ewc"
-    "ewc_nostalgia"
-    "gpm"
-    "agem"
-    "sdft"
+    # "ewc"
+    # "ewc_nostalgia"
+    # "gpm"
+    # "agem"
+    # "sdft"
 )
 
 run_exp() {
