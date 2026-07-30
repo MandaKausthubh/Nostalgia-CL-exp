@@ -203,6 +203,38 @@ class MNISTDataModule(BaseImageDataModule):
 # Split / benchmark datasets
 # ---------------------------------------------------------------------------
 
+def _load_cifar100_parsed_or_pickled(data_root: str, train: bool):
+    """Load CIFAR-100 from parsed image-folder layout if present, else pickled torchvision.
+
+    Parsed Kaggle layout expected:
+        <data_root>/train/<class>/
+        <data_root>/test/<class>/
+    or  <data_root>/cifar100/train/<class>/
+        <data_root>/cifar100/test/<class>/
+    """
+    split_name = "train" if train else "test"
+    candidates = [
+        os.path.join(data_root, split_name),
+        os.path.join(data_root, "cifar100", split_name),
+    ]
+    for folder in candidates:
+        if os.path.isdir(folder):
+            base = ImageFolder(folder)
+            if len(base.classes) > 0:
+                return base
+
+    # Fall back to original pickled CIFAR-100 (no download; avoids read-only FS on Kaggle).
+    try:
+        return torchvision.datasets.CIFAR100(
+            root=data_root, train=train, download=False, transform=None
+        )
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"CIFAR-100 not found at {data_root}. "
+            "Provide parsed image folders (train/ + test/) or original pickled CIFAR-100."
+        ) from e
+
+
 class SplitCIFAR100DataModule(BaseImageDataModule):
     """10 tasks x 10 classes from CIFAR-100."""
 
@@ -218,15 +250,11 @@ class SplitCIFAR100DataModule(BaseImageDataModule):
         return list(range(start, start + self.NUM_CLASSES))
 
     def _load_train(self):
-        base = torchvision.datasets.CIFAR100(
-            root=self.hparams.data_root, train=True, download=True, transform=None
-        )
+        base = _load_cifar100_parsed_or_pickled(self.hparams.data_root, train=True)
         return _ClassSubsetDataset(base, self._class_ids())
 
     def _load_val(self):
-        base = torchvision.datasets.CIFAR100(
-            root=self.hparams.data_root, train=False, download=True, transform=None
-        )
+        base = _load_cifar100_parsed_or_pickled(self.hparams.data_root, train=False)
         return _ClassSubsetDataset(base, self._class_ids())
 
 
