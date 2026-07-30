@@ -16,11 +16,11 @@ MAX_VAL="50"
 BS="8"
 LOG_EVERY="10"
 
-# Default local roots (override via env vars for Kaggle/other paths).
-DATA_ROOT="${DATA_ROOT:-./data}"
-DATA_ROOT_TINY="${DATA_ROOT_TINY:-$DATA_ROOT}"
-DATA_ROOT_DN="${DATA_ROOT_DN:-$DATA_ROOT}"
-DATA_ROOT_IMAGENET="${DATA_ROOT_IMAGENET:-$DATA_ROOT}"
+# Kaggle default Input paths (override via env vars for local/other paths).
+DATA_ROOT="${DATA_ROOT:-/kaggle/input/datasets/thanhbnhphan/cifar-100}"
+DATA_ROOT_TINY="${DATA_ROOT_TINY:-/kaggle/input/datasets/akash2sharma/tiny-imagenet}"
+DATA_ROOT_DN="${DATA_ROOT_DN:-/kaggle/input/datasets/kausthubhmanda/domainnet-fulldataset}"
+DATA_ROOT_IMAGENET="${DATA_ROOT_IMAGENET:-/kaggle/input/datasets/ambityga/imagenet100}"
 
 SUFFIX="${SUFFIX:-grid}"
 
