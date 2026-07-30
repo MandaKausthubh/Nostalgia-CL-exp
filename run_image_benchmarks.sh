@@ -49,6 +49,7 @@ METHODS=(
     "nostalgia"
     "naive_adam"
     "ewc"
+    "ewc_nostalgia"
     "gpm"
     "agem"
     "sdft"
@@ -67,11 +68,11 @@ run_exp() {
     echo "====================================================================="
 
     local extra_args=""
-    if [ "$method" = "nostalgia" ] || [ "$method" = "gpm" ]; then
+    if [ "$method" = "nostalgia" ] || [ "$method" = "gpm" ] || [ "$method" = "ewc_nostalgia" ]; then
         extra_args="--k 4 --nostalgia_accumulation_rounds 1 --nostalgia_max_hessian_batch 4 --nostalgia_num_samples 40"
     fi
     if [ "$method" = "sdft" ]; then
-        extra_args="--sdft_lambda_distillation 0.5 --sdft_temperature 2.0"
+        extra_args="${extra_args} --sdft_lambda_distillation 0.5 --sdft_temperature 2.0"
     fi
 
     local root_override=""
