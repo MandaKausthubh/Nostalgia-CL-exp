@@ -215,6 +215,7 @@ def _load_cifar100_parsed_or_pickled(data_root: str, train: bool):
     split_name = "train" if train else "test"
     candidates = [
         os.path.join(data_root, split_name),
+        os.path.join(data_root, "cifar100", "images", split_name),
         os.path.join(data_root, "cifar100", split_name),
     ]
     for folder in candidates:
