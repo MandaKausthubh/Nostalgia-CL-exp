@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Image benchmark loop for the unified train.py pipeline.
+# Grid benchmark script for the CNN CL pipeline.
+# Loops over backbones, benchmarks, and methods.
+# Usage:
+#   chmod +x run_cnn_benchmarks.sh
+#   ./run_cnn_benchmarks.sh
 
+# ----------------------------- Configuration --------------------------------
 ACCEL="gpu"
 DEVICES="1"
 PH1="1"
@@ -13,22 +18,21 @@ MAX_TRAIN="100"
 MAX_VAL="50"
 BS="8"
 LOG_EVERY="10"
-DATA_ROOT="./data"
+DATA_ROOT="/kaggle/input/"
 SUFFIX="grid"
 
 BACKBONES=(
-    "resnet10:32"
     "resnet18:32"
     "vit:224"
     "siglip:224"
 )
 
-# All tasks per benchmark.
+# Each benchmark: name, list of two task names, number of classes per task.
 BENCHMARKS=(
-    "cifar100_split:cifar100_t0 cifar100_t1 cifar100_t2 cifar100_t3 cifar100_t4 cifar100_t5 cifar100_t6 cifar100_t7 cifar100_t8 cifar100_t9"
-    "tinyimagenet_split:tinyimg_t0 tinyimg_t1 tinyimg_t2 tinyimg_t3"
-    "imagenet100_split:imagenet100_t0 imagenet100_t1 imagenet100_t2 imagenet100_t3 imagenet100_t4 imagenet100_t5 imagenet100_t6 imagenet100_t7 imagenet100_t8 imagenet100_t9"
-    "domainnet:domainnet_clipart domainnet_infograph domainnet_painting domainnet_quickdraw domainnet_real domainnet_sketch"
+    "cifar100_split:cifar100_t0 cifar100_t1"
+    # "tinyimagenet_split:tinyimg_t0 tinyimg_t1"
+    # "imagenet100_split:imagenet100_t0 imagenet100_t1"
+    # "domainnet:domainnet_real domainnet_sketch"
 )
 
 METHODS=(
@@ -40,9 +44,11 @@ METHODS=(
     "sdft"
 )
 
+# Override data locations if available.
 DATA_ROOT_TINY="./data"
 DATA_ROOT_DN="./data"
 
+# ------------------------------- Helpers ------------------------------------
 run_exp() {
     local backbone_name="$1"
     local image_size="$2"
@@ -53,6 +59,7 @@ run_exp() {
 
     echo "====================================================================="
     echo "Running: backbone=$backbone_name  bench=$bench_name  method=$method"
+    echo "Task(s): $tasks"
     echo "====================================================================="
 
     local extra_args=""
@@ -71,7 +78,7 @@ run_exp() {
         root_override="--data_root_domainnet $DATA_ROOT_DN"
     fi
 
-    python train.py \
+    python testing/train_cnn.py \
         --backbone "$backbone_name" \
         --image_size "$image_size" \
         --tasks $tasks \
@@ -89,7 +96,7 @@ run_exp() {
         --data_root "$DATA_ROOT" \
         $root_override \
         $extra_args \
-        --wandb_project "image-cl-benchmarks" \
+        --wandb_project "cnn-cl-benchmarks" \
         --wandb_name "$exp_name"
 
     echo ""
@@ -97,6 +104,7 @@ run_exp() {
     echo ""
 }
 
+# ------------------------------- Main loop ----------------------------------
 for spec in "${BACKBONES[@]}"; do
     IFS=':' read -r backbone_name image_size <<< "$spec"
     for bench in "${BENCHMARKS[@]}"; do
@@ -107,4 +115,4 @@ for spec in "${BACKBONES[@]}"; do
     done
 done
 
-echo "All image benchmark runs completed."
+echo "All benchmark runs completed."
