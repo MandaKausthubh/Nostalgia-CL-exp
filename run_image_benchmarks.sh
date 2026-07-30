@@ -5,7 +5,7 @@ set -euo pipefail
 # Override data roots with env vars or command-line flags:
 #   DATA_ROOT=... DATA_ROOT_TINY=... DATA_ROOT_DN=... DATA_ROOT_IMAGENET=... bash run_image_benchmarks.sh
 
-ACCEL="gpu"
+ACCEL="cpu"
 DEVICES="1"
 PH1="1"
 PH2="1"
