@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # Image benchmark loop for the unified train.py pipeline.
+# Override data roots with env vars or command-line flags:
+#   DATA_ROOT=... DATA_ROOT_TINY=... DATA_ROOT_DN=... DATA_ROOT_IMAGENET=... bash run_image_benchmarks.sh
 
 ACCEL="gpu"
 DEVICES="1"
@@ -13,8 +15,14 @@ MAX_TRAIN="100"
 MAX_VAL="50"
 BS="8"
 LOG_EVERY="10"
-DATA_ROOT="./data"
-SUFFIX="grid"
+
+# Default local roots (override via env vars for Kaggle/other paths).
+DATA_ROOT="${DATA_ROOT:-./data}"
+DATA_ROOT_TINY="${DATA_ROOT_TINY:-$DATA_ROOT}"
+DATA_ROOT_DN="${DATA_ROOT_DN:-$DATA_ROOT}"
+DATA_ROOT_IMAGENET="${DATA_ROOT_IMAGENET:-$DATA_ROOT}"
+
+SUFFIX="${SUFFIX:-grid}"
 
 BACKBONES=(
     "resnet10:32"
@@ -39,9 +47,6 @@ METHODS=(
     "agem"
     "sdft"
 )
-
-DATA_ROOT_TINY="./data"
-DATA_ROOT_DN="./data"
 
 run_exp() {
     local backbone_name="$1"
@@ -70,6 +75,11 @@ run_exp() {
     if [ "$bench_name" = "domainnet" ]; then
         root_override="--data_root_domainnet $DATA_ROOT_DN"
     fi
+    if [ "$bench_name" = "imagenet100_split" ]; then
+        root_override="--data_root $DATA_ROOT_IMAGENET"
+    else
+        root_override="--data_root $DATA_ROOT $root_override"
+    fi
 
     python train.py \
         --backbone "$backbone_name" \
@@ -86,7 +96,6 @@ run_exp() {
         --accelerator "$ACCEL" \
         --devices "$DEVICES" \
         --log_every_n_steps "$LOG_EVERY" \
-        --data_root "$DATA_ROOT" \
         $root_override \
         $extra_args \
         --wandb_project "image-cl-benchmarks" \
