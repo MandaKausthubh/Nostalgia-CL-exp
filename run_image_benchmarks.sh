@@ -40,9 +40,9 @@ BACKBONES=(
 # All tasks per benchmark.
 BENCHMARKS=(
     # "cifar100_split:cifar100_t0 cifar100_t1 cifar100_t2 cifar100_t3 cifar100_t4 cifar100_t5 cifar100_t6 cifar100_t7 cifar100_t8 cifar100_t9"
-    "tinyimagenet_split:tinyimg_t0 tinyimg_t1 tinyimg_t2 tinyimg_t3"
-    "imagenet100_split:imagenet100_t0 imagenet100_t1 imagenet100_t2 imagenet100_t3 imagenet100_t4 imagenet100_t5 imagenet100_t6 imagenet100_t7 imagenet100_t8 imagenet100_t9"
-    # "domainnet:domainnet_clipart domainnet_infograph domainnet_painting domainnet_quickdraw domainnet_real domainnet_sketch"
+    # "tinyimagenet_split:tinyimg_t0 tinyimg_t1 tinyimg_t2 tinyimg_t3"
+    # "imagenet100_split:imagenet100_t0 imagenet100_t1 imagenet100_t2 imagenet100_t3 imagenet100_t4 imagenet100_t5 imagenet100_t6 imagenet100_t7 imagenet100_t8 imagenet100_t9"
+    "domainnet:domainnet_clipart domainnet_infograph domainnet_painting domainnet_quickdraw domainnet_real domainnet_sketch"
 )
 
 METHODS=(
