@@ -355,77 +355,37 @@ class ImageNet100DataModule(BaseImageDataModule):
         return _ClassSubsetDataset(base, self._class_ids())
 
 
-class _DomainNetFolder(Dataset):
-    """ImageFolder-like dataset using a shared class_to_idx map."""
+class _DomainNetAdaptFolder(Dataset):
+    """Thin wrapper around pytorch_adapt's DomainNet dataset.
 
-    IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
+    Emits the (PIL image, target) contract that ImageClassificationDataset
+    expects, while pytorch_adapt handles fast list-file loading.
+    """
 
-    def __init__(self, root: str, class_to_idx: Dict[str, int], samples: Optional[List[Tuple[str, int]]] = None):
-        self.root = root
-        self.class_to_idx = class_to_idx
-        if samples is not None:
-            self.samples = samples
-        else:
-            self.samples = []
-            if os.path.isdir(root):
-                for class_name in sorted(os.listdir(root)):
-                    class_dir = os.path.join(root, class_name)
-                    if not os.path.isdir(class_dir):
-                        continue
-                    old_id = class_to_idx.get(class_name)
-                    if old_id is None:
-                        continue
-                    for fname in sorted(os.listdir(class_dir)):
-                        if fname.lower().endswith(self.IMG_EXTS):
-                            self.samples.append((os.path.join(class_dir, fname), old_id))
+    def __init__(self, root: str, domain: str, train: bool):
+        from pytorch_adapt.datasets import DomainNet
+
+        # DomainNet expects <root>/domainnet/{domain}_{train,test}.txt.
+        # If the user points data_root at the domainnet folder itself, strip it.
+        expected = os.path.join(root, "domainnet", f"{domain}_{'train' if train else 'test'}.txt")
+        if not os.path.exists(expected) and os.path.basename(root) == "domainnet":
+            root = os.path.dirname(root)
+        self.base = DomainNet(root=root, domain=domain, train=train, transform=None)
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.base)
 
     def __getitem__(self, idx):
-        path, target = self.samples[idx]
-        img = Image.open(path).convert("RGB")
-        return img, target
-
-
-def _split_samples_per_class(samples: List[Tuple[str, int]], val_ratio: float = 0.1):
-    """Deterministic per-class train/val split."""
-    by_class: Dict[int, List[Tuple[str, int]]] = {}
-    for path, target in samples:
-        by_class.setdefault(target, []).append((path, target))
-
-    train_samples, val_samples = [], []
-    for target, class_samples in by_class.items():
-        class_samples = sorted(class_samples)
-        n_val = max(1, int(len(class_samples) * val_ratio)) if len(class_samples) >= 10 else 1
-        step = max(1, len(class_samples) // n_val)
-        val_indices = set(range(0, len(class_samples), step)) if step > 0 else set()
-        val_indices = set(sorted(val_indices)[:n_val])
-        for i, item in enumerate(class_samples):
-            if i in val_indices:
-                val_samples.append(item)
-            else:
-                train_samples.append(item)
-    return train_samples, val_samples
-
-
-def _build_domainnet_class_map(data_root: str) -> Dict[str, int]:
-    """Shared 345-class name -> index map across all six DomainNet domains."""
-    domains = ["clipart", "infograph", "painting", "quickdraw", "real", "sketch"]
-    class_names = set()
-    root = os.path.join(data_root, "domainnet")
-    for domain in domains:
-        domain_root = os.path.join(root, domain)
-        if not os.path.isdir(domain_root):
-            continue
-        for class_name in os.listdir(domain_root):
-            if os.path.isdir(os.path.join(domain_root, class_name)):
-                class_names.add(class_name)
-    return {name: idx for idx, name in enumerate(sorted(class_names))}
+        img, target = self.base[idx]
+        return img, int(target)
 
 
 class DomainNetDataModule(BaseImageDataModule):
-    """One task per DomainNet domain; 345 shared classes per task."""
+    """One task per DomainNet domain; 345 shared classes per task.
+
+    Uses pytorch_adapt's list-file based DomainNet loader instead of walking
+    every image directory, which dramatically reduces startup time.
+    """
 
     IN_CHANNELS = 3
     NUM_CLASSES = 345
@@ -433,32 +393,12 @@ class DomainNetDataModule(BaseImageDataModule):
     def __init__(self, domain_name: str = "real", **kwargs):
         self.domain_name = domain_name
         super().__init__(**kwargs)
-        self.class_to_idx = _build_domainnet_class_map(self.hparams.data_root)
 
     def _load_train(self):
-        root = os.path.join(self.hparams.data_root, "domainnet", self.domain_name)
-        val_root = os.path.join(root, "val")
-        if os.path.isdir(val_root):
-            return _DomainNetFolder(root, self.class_to_idx)
-
-        full = _DomainNetFolder(root, self.class_to_idx)
-        train_samples, val_samples = _split_samples_per_class(full.samples, val_ratio=0.1)
-        self._train_samples = train_samples
-        self._val_samples = val_samples
-        return _DomainNetFolder(root, self.class_to_idx, samples=train_samples)
+        return _DomainNetAdaptFolder(root=self.hparams.data_root, domain=self.domain_name, train=True)
 
     def _load_val(self):
-        root = os.path.join(self.hparams.data_root, "domainnet", self.domain_name)
-        val_root = os.path.join(root, "val")
-        if os.path.isdir(val_root):
-            return _DomainNetFolder(val_root, self.class_to_idx)
-
-        if hasattr(self, "_val_samples"):
-            return _DomainNetFolder(root, self.class_to_idx, samples=self._val_samples)
-
-        full = _DomainNetFolder(root, self.class_to_idx)
-        _, val_samples = _split_samples_per_class(full.samples, val_ratio=0.1)
-        return _DomainNetFolder(root, self.class_to_idx, samples=val_samples)
+        return _DomainNetAdaptFolder(root=self.hparams.data_root, domain=self.domain_name, train=False)
 
 
 # ---------------------------------------------------------------------------

@@ -297,7 +297,8 @@ class ImageModelModule(pl.LightningModule):
             raise ValueError("Batch does not contain any label key (tried 'label', 'labels', 'target', 'targets')")
 
         logits = self(input_ids=input_ids, attention_mask=attention_mask, task_name=task_name)
-        loss = self.criterion(logits, targets)
+        ce_loss = self.criterion(logits, targets)
+        loss = ce_loss
 
         if (
             self.method == "sdft"
@@ -323,15 +324,26 @@ class ImageModelModule(pl.LightningModule):
                 on_epoch=True,
                 add_dataloader_idx=False,
             )
+            self.log(
+                f"{stage}/sdft_total_loss",
+                loss,
+                prog_bar=False,
+                sync_dist=True,
+                on_step=True,
+                on_epoch=True,
+                add_dataloader_idx=False,
+            )
 
         preds = torch.argmax(logits, dim=-1)
         acc = (preds == targets).float().mean()
 
+        # Log CE loss as the canonical {stage}/loss so all methods are comparable.
+        # For SDFT the distillation-augmented loss is still used for backprop and logged separately.
         if stage.endswith("/train") or stage.endswith("/alignment"):
-            self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
+            self.log(f"{stage}/loss", ce_loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
             self.log(f"{stage}/acc", acc, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
         else:
-            self.log(f"{stage}/loss", loss, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True, add_dataloader_idx=False)
+            self.log(f"{stage}/loss", ce_loss, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True, add_dataloader_idx=False)
             self.log(f"{stage}/acc", acc, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True, add_dataloader_idx=False)
 
         self._last_logits = logits
