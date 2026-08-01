@@ -370,6 +370,8 @@ class _DomainNetAdaptFolder(Dataset):
         from pytorch_adapt.datasets import DomainNet
         from pytorch_adapt.datasets import utils as adapt_utils
 
+        print(f"Loading DomainNet domain '{domain}' from {root} (train={train})")
+
         # Some Kaggle DomainNet copies are subsets; don't fail on expected length.
         _orig_check_length = adapt_utils.check_length
         def _no_op_check_length(dataset, correct_length):
@@ -381,6 +383,7 @@ class _DomainNetAdaptFolder(Dataset):
         expected = os.path.join(root, "domainnet", f"{domain}_{'train' if train else 'test'}.txt")
         if not os.path.exists(expected) and os.path.basename(root) == "domainnet":
             root = os.path.dirname(root)
+        print(f"Loading DomainNet domain '{domain}' from {root} (train={train})")
         self.base = DomainNet(root=root, domain=domain, train=train, transform=None)
         adapt_utils.check_length = _orig_check_length
 
