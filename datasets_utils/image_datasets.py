@@ -83,7 +83,11 @@ def _maybe_subset(ds, max_samples):
         return ds
 
     n = min(max_samples, len(ds))
-    labels = [int(ds[i][1]) for i in range(len(ds))]
+    # Fast label access: avoid opening every image if dataset exposes labels directly.
+    if hasattr(ds, "labels") and isinstance(ds.labels, (list, tuple)):
+        labels = [int(lab) for lab in ds.labels]
+    else:
+        labels = [int(ds[i][1]) for i in range(len(ds))]
     by_class = {}
     for idx, lab in enumerate(labels):
         by_class.setdefault(lab, []).append(idx)
@@ -371,6 +375,8 @@ class _DomainNetAdaptFolder(Dataset):
         if not os.path.exists(expected) and os.path.basename(root) == "domainnet":
             root = os.path.dirname(root)
         self.base = DomainNet(root=root, domain=domain, train=train, transform=None)
+        # Expose labels for fast stratified subsampling without opening every image.
+        self.labels = [int(x) for x in self.base.labels]
 
     def __len__(self):
         return len(self.base)
