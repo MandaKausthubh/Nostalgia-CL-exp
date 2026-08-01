@@ -144,7 +144,8 @@ def run_sequential_pipeline(args):
     print_global("Initializing Weights & Biases (wandb) run...", rank=local_rank)
 
     # Drop unused LM-only defaults when running image tasks to avoid confusing printout.
-    _is_image = active_tasks and active_tasks[0] not in TEXT_TASK_REGISTRY
+    _active_tasks = getattr(args, "tasks", [])
+    _is_image = _active_tasks and _active_tasks[0] not in TEXT_TASK_REGISTRY
     display_args = vars(args).copy()
     if _is_image:
         for k in ["model_name", "use_lora", "lora_r", "lora_alpha", "lora_dropout",
