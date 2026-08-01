@@ -368,6 +368,13 @@ class _DomainNetAdaptFolder(Dataset):
 
     def __init__(self, root: str, domain: str, train: bool):
         from pytorch_adapt.datasets import DomainNet
+        from pytorch_adapt.datasets import utils as adapt_utils
+
+        # Some Kaggle DomainNet copies are subsets; don't fail on expected length.
+        _orig_check_length = adapt_utils.check_length
+        def _no_op_check_length(dataset, correct_length):
+            pass
+        adapt_utils.check_length = _no_op_check_length
 
         # DomainNet expects <root>/domainnet/{domain}_{train,test}.txt.
         # If the user points data_root at the domainnet folder itself, strip it.
@@ -375,6 +382,8 @@ class _DomainNetAdaptFolder(Dataset):
         if not os.path.exists(expected) and os.path.basename(root) == "domainnet":
             root = os.path.dirname(root)
         self.base = DomainNet(root=root, domain=domain, train=train, transform=None)
+        adapt_utils.check_length = _orig_check_length
+
         # Expose labels for fast stratified subsampling without opening every image.
         self.labels = [int(x) for x in self.base.labels]
 
