@@ -6,7 +6,7 @@ set -euo pipefail
 #   DATA_ROOT_DN=/path/to/domainnet bash run_image_benchmarks.sh
 
 ACCEL="${ACCEL:-gpu}"
-DEVICES="${DEVICES:-1}"
+DEVICES="${DEVICES:-2}"
 
 # Full training budget for DomainNet.
 PH1="20"            # head-alignment epochs per domain
