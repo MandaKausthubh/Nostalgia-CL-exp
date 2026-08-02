@@ -1,0 +1,205 @@
+\begin{abstract}
+Pre-trained transformer models are typically adapted to downstream tasks via supervised fine-tuning, but sequential adaptation often leads to \textit{catastrophic forgetting}, where performance on earlier tasks degrades. Existing mitigation strategies commonly rely on data replay, architectural modifications, or heuristic regularization, limiting their scalability. We introduce \textbf{Nostalgia}, a data-free, optimization-based method for continual supervised fine-tuning that mitigates forgetting by constraining parameter updates to directions that minimally interfere with previously learned tasks. Our approach is grounded in a local quadratic approximation of task losses and operationalizes this principle through a tractable low-rank approximation of the average Hessian, enabling efficient projection-based updates compatible with modern parameter-efficient fine-tuning. Experiments across Vision and Language benchmarks demonstrate that Nostalgia consistently preserves prior-task performance without compromising adaptation to new tasks.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+The past two years have witnessed a rapid proliferation of capable sub-billion-parameter transformer models. Families such as MobileLLM [\cite{liu2024mobilellmoptimizingsubbillionparameter}], SmolLM2 [\cite{allal2025smollm2smolgoesbig}], and Qwen2.5 [\cite{qwen2025qwen25technicalreport}] now achieve strong performance on standard language and vision benchmarks while remaining deployable on memory-constrained devices without cloud infrastructure. Unlike their frontier counterparts, these models are predominantly used through sequential supervised fine-tuning: a single pre-trained backbone is incrementally adapted as new tasks arise, often in settings such as edge devices, privacy-sensitive deployments, or resource-constrained research environments where neither full retraining nor access to prior task data is feasible.
+
+This incremental adaptation regime reliably produces catastrophic forgetting [10]: as the model is fine-tuned on a new task, gradient updates overwrite parameters critical to earlier tasks, causing sharp performance degradation. The problem is particularly acute at sub-billion-scale. Smaller models have lower overparameterization, so new task gradients exert greater relative pressure on the shared parameter space. At the same time, the practical constraints that make compact models attractive, such as limited memory, on-device execution, and data privacy requirements, also foreclose the most commonly used mitigation strategies. Replay-based methods such as DER [\cite{buzzega2020darkexperiencegeneralcontinual}] require storing and replaying samples from previous tasks, conflicting with privacy constraints and negating the storage advantages of small models. Architectural isolation approaches grow the model with every new task, directly undermining the parameter-budget motivation for using compact models in the first place. Regularization methods such as EWC [\cite{Kirkpatrick_2017}] and L2-SP [\cite{li2020baseline}] are sensitive to hyperparameter selection and provide no theoretical characterization of the update directions that actually prevent forgetting.
+
+A principled alternative lies in the framework of local continual learning [\cite{lanzillotta2024local}]. show that under a local quadratic approximation of past-task losses — accurate whenever optimization remains near task-specific optima — forgetting is provably zero if and only if parameter updates lie in the null space of the average Hessian of previously learned tasks. This provides an exact, data-free characterization of the space of safe update directions. Despite its theoretical strength, this framework has seen little practical realization: enforcing the null-space constraint requires computing and storing the full Hessian, which is quadratic in the number of parameters and entirely intractable even at the hundreds-of-millions scale.
+
+We introduce \textbf{Nostalgia}, a method that makes local continual learning tractable for compact transformers by replacing the full Hessian with an efficient low-rank approximation. Dominant curvature directions are estimated via Hessian-vector products and the Lanczos algorithm, and each gradient update is projected onto their orthogonal complement before being applied. This enforces the theoretically optimal null-space constraint using only matrix-vector operations, with memory and compute scaling linearly in the retained rank kk
+k. The projection is applied within a LoRA fine-tuning setup, restricting second-order computations to the low-rank adapter subspace and keeping overhead proportional to the adapter rank rather than the full model width. Nostalgia requires no stored task data, introduces no new parameters, and is compatible with standard first-order optimizers. We evaluate it on ViT-B/32 for continual vision classification over DomainNet and GPT-2 for language, demonstrating consistent retention of prior-task performance without sacrificing plasticity on new tasks.
+
+Our contributions are as follows:
+
+\begin{itemize}
+
+  \item[1.] \textbf{Tractable instantiation of optimal local continual learning}: We model the continual learning problem as a constrained optimisation problem based on the work of  [\cite{lanzillotta2024local}]. for compact transformers by replacing the intractable full Hessian with a low-rank approximation computed entirely via Hessian-vector products, making the method applicable at sub-billion scale. We leave scaling this to larger models as future work.
+
+  \item[2.] \textbf{Efficient distributed Hessian accumulation}: We introduce a procedure that maintains a running average of past-task curvature in factored form, merging per-task spectral estimates without materializing any full parameter-space matrix and synchronizing across workers through a reduced Gram matrix.
+
+  \item[4.] \textbf{Rank ablation}: We study the effect of the rank parameter k on the forgetting-plasticity trade-off, providing practical guidance for its selection and empirically confirming Theorem \ref{theorem:1}.
+
+\end{itemize}
+
+
+\section{Related Works}
+\label{sec:relatedworks}
+
+\noindent \textbf{Regularization and Parameter-Constrained Approaches:} 
+A classical line of work introduces explicit regularization terms to keep fine-tuned parameters close to their pre-trained initialization. Methods such as L2-SP and Elastic Weight Consolidation (EWC) [\cite{Kirkpatrick_2017}] constrain updates using $\mathcal{L}_2$ or Fisher-weighted penalties, discouraging deviation from important pre-trained weights.
+Other extensions—such as Selective Projection Decay or Laplace-based priors—attempt to model parameter importance more precisely. While these methods are conceptually simple, their performance is highly sensitive to regularization strength, and they often underperform on large-scale multimodal models, where the correspondence between parameter distance and functional similarity is weak. The term below represents the loss function $\mathcal{L}_{l2sp}(\theta)$ for a parameter $\theta$ as the loss function of the task, $\mathcal{L}_{task}(\theta)$, and a regulariser representing the \textit{l2-norm} based distance from $\theta_0$ the parameter weights after pre-training:
+$$
+\mathcal{L}_{l2sp}(\theta) = \mathcal{L}_{task}(\theta) + \frac{\lambda}{2}||\theta - \theta_0||^2_2
+$$
+
+A more selective formulation is \textit{Elastic Weight Consolidation(EWC)}, which estimates the importance of each parameter based on the Fisher Information Matrix $F$ computed during pretraining.  
+The fine-tuning loss is augmented as:
+$$
+\mathcal{L}_{\text{EWC}}(\theta) = \mathcal{L}_{\text{task}}(\theta) + \frac{\lambda}{2} \sum_i F_i (\theta_i - \theta_{0,i})^2,
+$$
+
+
+\noindent \textbf{Parameter Isolation Methods}: Adapters (Houlsby et al., 2019) and their variants (e.g., AdaptFormer, AdapterFusion)\textbf{[ADD CITATIONS PROPERLY]} introduce small, trainable bottleneck modules within otherwise frozen transformer models, allowing the model to adapt to new tasks without modifying the original backbone parameters. The key idea is to insert these lightweight modules—typically consisting of a down-projection, nonlinearity, and up-projection—between existing layers of a pre-trained model. \textbf{[CITE HALRP]} This design enables parameter-efficient fine-tuning, as only the adapters are updated while the bulk of the model remains frozen. Variants such as AdaptFormer improve the integration of these modules by strategically placing them in attention and feed-forward sublayers, while AdapterFusion allows multiple pre-trained adapters to be combined, facilitating multi-task learning and transfer learning by leveraging knowledge from previously learned tasks. Overall, adapters provide a scalable and modular approach to extending large pre-trained transformers to diverse downstream tasks without incurring the computational and memory costs of full fine-tuning.
+
+
+\noindent \textbf{Rehearsal Methods}: Rehearsal-based strategies mitigate catastrophic forgetting by replaying samples from previous tasks during new task training. In language model SFT, this involves mixing pretraining data with downstream batches to preserve general knowledge and prevent domain overfitting. Approaches vary in buffer maintenance, sampling balance, and selective replay, offering a scalable, practical alternative to costly second-order or parameter-constrained methods for continual learning and SFT retention. Popular methods for the same are \textbf{Dark Experience Replay (DER, DER++), Meta-Experience Replay (MER), and Hindsight Anchor Learning} \cite{NEURIPS2020_b704ea2c} \textbf{[ADD CITATIONS]}.
+
+
+\noindent \textbf{Ensembling}:\textbf{[ADD CITATIONS]} Weight interpolation (“model soups”) averages parameters across fine-tuned and pre-trained models, often improving robustness without retraining.
+Output ensembling aggregates predictions from different checkpoints to strike a balance between specialization and generality. Although effective in mid-scale settings (e.g., ViT, CLIP, LLaMA-7B), these techniques scale poorly to frontier models due to memory and alignment constraints. These methods have shown resilience even in other modalities such as Language.
+
+
+\section{Problem Setup: SFT for Continual Learning}
+\label{sec:problem_setup}
+
+Our problem considers the setting of continual learning as the sequential acquisition of multiple supervised tasks $\tau_0,\tau_1, \tau_2, \ldots, \tau_T$, where the data for task $\tau_t$ is denoted $D_t = \{(x, y)\ |\ x \in \mathcal{X}_t, y \in \mathcal{Y}_t\}$. $\tau_0$ is considered as the pre-training task. We define forgetting for task $\tau_t$ as:
+\begin{equation}
+    E_t(\theta) = L_t(\theta) - L_t(\theta_t)
+\end{equation}
+where $L_t(\theta)$ is the loss function for $\tau_t$ evaluated for model parameters $\theta$, and $\theta_t$ are the parameters at the completion of learning task $\tau_t$.
+The goal of continual learning is to incrementally update the model on each new task $\tau_t$ using only $D_t$ and possibly an external memory $M_t$ (e.g., a buffer), while retaining performance on previously learned tasks. Performance is measured by minimizing both forgetting $E_t(\theta)$ and the following multi-task loss:
+\begin{equation}
+    L_t^{MT}(\theta) = \frac{1}{t} \sum_{i=1}^t L_i(\theta)
+\end{equation}
+The continual learning objective is to find update rules so that, after each step, the updated parameters approximately minimize the multi-task loss using only current task data, $D_t$ and memory, $M_t$:
+\begin{equation}
+    \min_{\theta_t} \; obj_t(D_t, M_t) \approx L_t^{MT}(\theta_t)
+\end{equation}
+The central challenge is that direct access to past task data $D_o$, for $o < t$, is unavailable. Thus, the algorithm must approximate the true multi-task loss with whatever information is stored or accessible. Previous work addresses this by using polynomial approximations for the loss function near each task optimum. Empirically and theoretically, loss surfaces tend to be well-behaved and locally convex near minima, so quadratic approximations are widely adopted:
+\begin{align}
+    \hat{L}_t(\theta) &\approx L_t(\theta_t) + (\theta - \theta_t)^T \nabla L_t(\theta_t) + \frac{1}{2} (\theta - \theta_t)^T H_t(\theta_t) (\theta - \theta_t)
+\end{align}
+where $H_t(\theta_t)$ is the Hessian of $L_t$ evaluated at $\theta_t$. This lets us redefine the forgetting term as
+\begin{equation}
+    E_t(\theta) = (\theta - \theta_t)^T \nabla L_t(\theta_t) + \frac{1}{2} (\theta - \theta_t)^T H_t(\theta_t) (\theta - \theta_t)
+\end{equation}
+
+~\cite{lanzillotta2024local} primarily classify continual learning algorithms into two categories — local and global — based on their approach to multi-task loss approximation:
+
+\noindent \textbf{Definition 3.1} (Local and global task loss approximations). Let I(X; Y) denote the mutual information of the pair of random variables (X, Y). We say that the task loss's second order polynomial approximation $\hat{L}_t(\theta)$ is \textit{local} when $I(\hat{L}_t(\theta); \theta_t) >0\ \forall\ \theta \in \Theta$, and that it is global when $I(\hat{L}(\theta);\theta_t) = 0\ \forall\ \theta\in \Theta - \{\theta_t\}$.
+
+Local algorithms, however, do provide a strong theoretical justification for searching the space from which we can get zero forgetting, as stated in the following lemma from \cite{lanzillotta2024local}:
+
+\noindent \textbf{Lemma: \cite{lanzillotta2024local}}: \textit{(Optimal quadratic local continual learning) For any continual learning algorithm producing a sequence of parameters $\theta_1, \theta_2, \ldots\theta_t$ such that $\theta_i$ is the local minima of $L_i$ and $\sup_{\theta_i,\theta_k} ||\theta_i - \theta_k||^3 < \epsilon$, the following relationship holds:}
+\begin{align*}
+    E(1),\ldots E(t-1) &= 0 \implies
+    E(t) = \frac{1}{2}\Delta_t^T\left(\frac{1}{t} \sum_{j=1}^{t-1}H_j^* \right)\Delta_t
+ \geq0\end{align*}
+\textit{Moreover, if $E(1),\ldots E(t-1)=0$ the optimal learning objective for task t is:}
+$$
+\min_{\Delta_t \in \Theta} L_t(\theta_{t-1} + \Delta_t)\quad s.t.\quad \Delta_t^T\left(\frac{1}{t} \sum_{j=1}^{t-1}H_j^* \right)\Delta_t = 0
+$$
+Note that the constraints described through the lemma force the update steps to lie in the \textit{null-space} of the average \textit{Hessian matrix}. Intuitively, when a quadratic approximation to the loss is accurate enough, and each task solution is a local minimum, the parameter updates must be taken along directions where the multi-task loss landscape is (absolutely) flat to prevent forgetting.
+
+
+
+\section{Method: Nostalgia}
+\label{sec:nostalgia}
+
+We consider the standard continual learning setup in which a model with parameters $\theta \in \mathbb{R}^n$ is trained sequentially on tasks $\tau_1, \dots, \tau_T$. Following \cite{lanzillotta2024local}, we approximate each past task loss $L_{\tau_i}$ by a second-order Taylor expansion around its solution $\theta_{\tau_i}^*$. Zero forgetting for all previous tasks is then achieved iff the update direction for the current task lies in the null space of the average Hessian of past losses. Formally, after completing tasks $1, \dots, t-1$, the update $\Delta_t$ for task $t$ must satisfy
+\begin{equation}
+\Delta_t^\top \bar{H}_{t-1} \Delta_t = 0,
+\qquad
+\bar{H}_{t-1} = \frac{1}{t-1}\sum_{i=1}^{t-1} H_{\tau_i}(\theta_{\tau_i}^*).
+\label{eq:nullspace-constraint}
+\end{equation}
+Nostalgia implements this condition directly. Instead of replaying past data or adding a parameter-anchor penalty, we constrain every gradient step to directions that preserve flatness of the past-task loss landscape.
+
+\subsection{Low-rank Hessian approximation}
+
+Storing or inverting an $n \times n$ Hessian is infeasible for modern neural networks. Empirically, however, task Hessians are effectively low-rank: most eigenvalues are near zero and only a small subspace carries significant curvature \cite{sagun2017eigenvalueshessiandeeplearning, Papyan2019MeasurementsOT, pmlr-v97-ghorbani19b, li2024hessian}. We therefore approximate the average Hessian by its top-$k$ eigendecomposition,
+\begin{equation}
+\bar{H}_{t-1} \approx Q_{t-1} \Lambda_{t-1} Q_{t-1}^\top,
+\end{equation}
+where $Q_{t-1} \in \mathbb{R}^{n \times k}$ has orthonormal columns and $\Lambda_{t-1} \in \mathbb{R}^{k \times k}_+$ is diagonal. Given this approximation, Nostalgia projects each raw gradient $g_t$ onto the orthogonal complement of $\mathrm{span}(Q_{t-1})$:
+\begin{equation}
+\tilde{g}_t = \bigl(I - Q_{t-1}^{}Q_{t-1}^{\top}\bigr) g_t.
+\label{eq:projection}
+\end{equation}
+Because $\ker(I - QQ^\top) = \mathrm{span}(Q)$, the projected update has no component in the high-curvature directions of past tasks, which is exactly the requirement implied by \eqref{eq:nullspace-constraint} under the low-rank approximation.
+
+\subsection{Single-task eigenspace estimation}
+
+For a completed task $\tau$, we estimate its dominant eigenspace without forming the Hessian explicitly. Over $E_a$ accumulation rounds, a Lanczos routine driven by Hessian--vector products returns a stochastic rank-$k$ approximation
+\begin{equation}
+H_\tau^{(e)} \approx Q_\tau^{(e)} \Lambda_\tau^{(e)} \bigl(Q_\tau^{(e)}\bigr)^\top.
+\end{equation}
+We keep only the non-negative spectral part and form the weighted factor $F_\tau^{(e)} = Q_\tau^{(e)} \bigl(\Lambda_\tau^{(e)}\bigr)_+^{1/2}$. Concatenating and renormalizing across rounds gives
+\begin{equation}
+F_\tau^{\mathrm{loc}} = \frac{1}{\sqrt{E_a}} \Bigl[ F_\tau^{(1)} \; \cdots \; F_\tau^{(E_a)} \Bigr],
+\end{equation}
+so that $F_\tau^{\mathrm{loc}}(F_\tau^{\mathrm{loc}})^\top \approx \frac{1}{E_a}\sum_{e=1}^{E_a} H_\tau^{(e)}$. In a distributed setting, workers never exchange parameter-space vectors; they instead average the small Gram matrix $G_\tau = (F_\tau^{\mathrm{loc}})^\top F_\tau^{\mathrm{loc}}$, compute its leading eigenpairs $G_\tau V_\tau = V_\tau \Sigma_\tau$, and reconstruct a local orthonormal basis $Q_\tau = F_\tau^{\mathrm{loc}} V_\tau \Sigma_\tau^{-1/2}$ with eigenvalues $\Lambda_\tau = \Sigma_\tau$.
+
+\subsection{Accumulating curvature across tasks}
+
+After task $t$ finishes, we rebuild a memory $(Q_{\mathrm{mem}}, \Lambda_{\mathrm{mem}})$ that approximates the running average Hessian $\bar{H}_t = \frac{t-1}{t}\bar{H}_{t-1} + \frac{1}{t}H_{\tau_t}$. Given the previous memory $Q_{\mathrm{mem}} \Lambda_{\mathrm{mem}} Q_{\mathrm{mem}}^\top$ and the new task summary $Q_t \Lambda_t Q_t^\top$, we form weighted factors
+\begin{equation}
+F_{\mathrm{old}} = \sqrt{\frac{t-1}{t}}\, Q_{\mathrm{mem}} \Lambda_{\mathrm{mem}}^{1/2},
+\qquad
+F_{\mathrm{new}} = \sqrt{\frac{1}{t}}\, Q_t \Lambda_t^{1/2},
+\end{equation}
+concatenate $F = [F_{\mathrm{old}} \; F_{\mathrm{new}}]$, and recover the top-$k$ eigenspace of $FF^\top$. This merging is performed with a stable factor-SVD procedure (Algorithm~\ref{alg:accumulate}) and avoids ever materializing an $n \times n$ matrix.
+
+\begin{algorithm}[tb]
+\caption{\textsc{Nostalgia} — sequential constrained optimization}
+\label{alg:nostalgia}
+\begin{algorithmic}
+\STATE {\bfseries Input:} $\theta_0$, tasks $\{\tau_t\}_{t=1}^T$, rank $k$
+\STATE {\bfseries Initialize:} $Q_0 \leftarrow \varnothing$, $\mathcal{M}_0 \leftarrow \varnothing$
+\FOR{$t = 1$ {\bfseries to} $T$}
+    \FOR{batches $B \subset D_{\tau_t}$}
+        \STATE $g_t \leftarrow \nabla_\theta \ell_t(\theta; B)$
+        \STATE $\tilde g_t \leftarrow (I - Q_{t-1}Q_{t-1}^{\top}) g_t$
+        \STATE $\theta \leftarrow \theta - \eta_t \tilde g_t$
+    \ENDFOR
+    \STATE $\mathcal{M}_t \leftarrow \mathcal{M}_{t-1} \cup \{\tau_t\}$
+    \STATE $(Q_t, \Lambda_t) \leftarrow \textsc{AccumulatePastDomains}(\mathcal{M}_t, k)$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[tb]
+\caption{\textsc{AccumulatePastDomains}}
+\label{alg:accumulate}
+\begin{algorithmic}
+\STATE {\bf Input:} seen tasks $\mathcal{M} = \{\tau_1,\dots,\tau_t\}$, rank $k$
+\STATE {\bf Output:} Hessian memory $(Q_{\mathrm{mem}}, \Lambda_{\mathrm{mem}})$
+\STATE $(Q_{\mathrm{mem}}, \Lambda_{\mathrm{mem}}) \leftarrow (\varnothing, \varnothing)$
+\FOR{$i = 1$ {\bfseries to} $t$}
+    \STATE $(Q_{\mathrm{new}}, \Lambda_{\mathrm{new}}) \leftarrow \textsc{SingleDomainEigenspace}(\tau_i, k)$
+    \IF{$Q_{\mathrm{mem}} = \varnothing$}
+        \STATE $(Q_{\mathrm{mem}}, \Lambda_{\mathrm{mem}}) \leftarrow (Q_{\mathrm{new}}, \Lambda_{\mathrm{new}})$
+    \ELSE
+        \STATE $\alpha \leftarrow \frac{i-1}{i}, \quad \beta \leftarrow \frac{1}{i}$
+        \STATE $F_{\mathrm{old}} \leftarrow \sqrt{\alpha}\, Q_{\mathrm{mem}}\,\mathrm{diag}(\sqrt{\Lambda_{\mathrm{mem}}})$
+        \STATE $F_{\mathrm{new}} \leftarrow \sqrt{\beta}\, Q_{\mathrm{new}}\,\mathrm{diag}(\sqrt{\Lambda_{\mathrm{new}}})$
+        \STATE $F \leftarrow [F_{\mathrm{old}} \; F_{\mathrm{new}}]$
+        \STATE $(Q_{\mathrm{mem}}, \Lambda_{\mathrm{mem}}) \leftarrow \textsc{TopEigenpairs}(FF^\top, k)$
+    \ENDIF
+\ENDFOR
+\STATE \textbf{return} $(Q_{\mathrm{mem}}, \Lambda_{\mathrm{mem}})$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Nostalgia-EWC: a low-rank quadratic regularizer}
+
+EWC \cite{Kirkpatrick_2017} prevents forgetting with a diagonal Fisher penalty around the previous-task solution $\theta^*$. The penalty pushes parameters away from $\theta^*$ only along directions that the Fisher deems important. Nostalgia-EWC replaces the diagonal Fisher with the full low-rank Hessian memory accumulated across past tasks:
+\begin{equation}
+R_{\mathrm{NE}}(\theta) = \frac{\lambda}{2}\,(\theta - \theta^*)^\top Q_{t-1} \Lambda_{t-1} Q_{t-1}^\top (\theta - \theta^*),
+\label{eq:ewc-nostalgia-loss}
+\end{equation}
+where $(Q_{t-1}, \Lambda_{t-1})$ is the same running average Hessian memory used by Nostalgia and $\theta^*$ is the backbone solution after the most recent task. The gradient contribution on the flattened backbone parameters is
+\begin{equation}
+g_{\mathrm{NE}} = \lambda\, Q_{t-1}^{} \Lambda_{t-1}^{} Q_{t-1}^\top (\theta - \theta^*).
+\label{eq:ewc-nostalgia-grad}
+\end{equation}
+This can be interpreted as EWC's quadratic anchor loss, but with curvature measured by the global Hessian eigenspace rather than a per-sample Fisher diagonal. Computationally, the low-rank structure makes the matrix-vector products in \eqref{eq:ewc-nostalgia-grad} cheap: each step costs $O(nk)$, the same order as the Nostalgia projection in \eqref{eq:projection}. Nostalgia-EWC is therefore a natural hybrid: it shares the same spectral memory as Nostalgia but implements forgetting prevention as a soft parameter-anchor regularizer instead of a hard gradient projection.
+
+\subsection{Complexity}
+
+For $n$ trainable parameters and memory rank $k$, Nostalgia adds $O(nk)$ operations per update for the projection in \eqref{eq:projection} and stores $O(nk)$ parameters in $Q$. The Lanczos estimation costs $O(k \cdot \mathrm{HVP})$ per task, where each Hessian--vector product has roughly the cost of one gradient evaluation. When Nostalgia is combined with parameter-efficient fine-tuning (e.g., LoRA), $n$ is small and the method remains tractable on standard accelerators.
+
