@@ -79,6 +79,7 @@ for method in "${METHODS[@]}"; do
         --batch_size "$BS" \
         --accelerator "$ACCEL" \
         --devices "$DEVICES" \
+        --strategy ddp_find_unused_parameters_true \
         --log_every_n_steps "$LOG_EVERY" \
         --val_check_interval "$VAL_EVERY" \
         --wandb_project "domainnet-cl" \
