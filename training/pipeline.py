@@ -178,6 +178,8 @@ def run_sequential_pipeline(args):
                 max_val_samples=cfg["max_val_samples"],
                 image_size=getattr(args, "image_size", 32),
                 data_root=cfg["data_root"],
+                num_workers=getattr(args, "num_workers", 0),
+                pin_memory=getattr(args, "pin_memory", False),
             )
         else:
             dm = DMClass(

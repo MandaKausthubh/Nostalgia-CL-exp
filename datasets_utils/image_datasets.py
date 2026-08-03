@@ -131,6 +131,7 @@ class BaseImageDataModule(pl.LightningDataModule):
         max_val_samples: Optional[int] = None,
         image_size: int = 32,
         num_workers: int = 0,
+        pin_memory: bool = False,
         data_root: str = "./data",
     ):
         super().__init__()
@@ -138,6 +139,23 @@ class BaseImageDataModule(pl.LightningDataModule):
         self.train_ds = None
         self.val_ds = None
         self.transform = _build_image_transform(self.IN_CHANNELS, image_size)
+
+    def _dataloader(self, dataset, shuffle: bool):
+        return DataLoader(
+            dataset,
+            batch_size=self.hparams.batch_size,
+            shuffle=shuffle,
+            num_workers=self.hparams.num_workers,
+            pin_memory=self.hparams.pin_memory,
+            persistent_workers=bool(self.hparams.num_workers > 0),
+            drop_last=shuffle,
+        )
+
+    def train_dataloader(self):
+        return self._dataloader(self.train_ds, shuffle=True)
+
+    def val_dataloader(self):
+        return self._dataloader(self.val_ds, shuffle=False)
 
     def _load_train(self):
         raise NotImplementedError

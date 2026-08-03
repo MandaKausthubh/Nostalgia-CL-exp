@@ -98,6 +98,10 @@ def parse_args():
                             help="Folder containing tiny-imagenet-200 (overrides --data_root for tinyimg_* tasks)")
     data_group.add_argument("--data_root_domainnet", type=str, default=None,
                             help="Folder containing the domainnet directory (overrides --data_root for domainnet_* tasks)")
+    data_group.add_argument("--num_workers", type=int, default=0,
+                            help="DataLoader worker processes")
+    data_group.add_argument("--pin_memory", action="store_true",
+                            help="Use pin_memory in DataLoaders (speeds up GPU transfer)")
 
     # Nostalgia
     nostalgia_group = parser.add_argument_group("Nostalgia")

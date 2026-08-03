@@ -13,7 +13,6 @@ PH1="20"            # head-alignment epochs per domain
 PH2="40"            # full-finetuning epochs per domain
 WARMUP="500"        # linear-warmup steps
 TOTAL_STEPS="10000" # scheduler horizon per full-finetuning domain
-BS="64"             # GPU-safe batch for ResNet-18 @ 224x224
 LR="1e-3"           # ResNet-18 full FT
 HEAD_LR="5e-4"
 WEIGHT_DECAY="1e-4"
@@ -26,6 +25,25 @@ DATA_ROOT_DN="${DATA_ROOT_DN:-/kaggle/input/datasets/kausthubhmanda/domainnet-fu
 
 BACKBONE="${BACKBONE:-resnet18}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+
+# Per-GPU batch size: bigger backbones need smaller batches on T4.
+if [ -z "${BS:-}" ]; then
+    if [ "$BACKBONE" = "vit" ] || [ "$BACKBONE" = "siglip" ]; then
+        BS="32"
+    else
+        BS="128"
+    fi
+fi
+
+# Gradient accumulation to keep effective batch large for big backbones.
+if [ -z "${ACCUM:-}" ]; then
+    if [ "$BACKBONE" = "vit" ] || [ "$BACKBONE" = "siglip" ]; then
+        ACCUM="4"
+    else
+        ACCUM="1"
+    fi
+fi
 
 TASKS=(
     "domainnet_clipart" "domainnet_infograph" "domainnet_painting"
@@ -72,11 +90,14 @@ for method in "${METHODS[@]}"; do
         --data_root "$DATA_ROOT_DN" \
         --data_root_domainnet "$DATA_ROOT_DN" \
         --max_length 32 \
+        --num_workers "$NUM_WORKERS" \
+        --pin_memory \
         --epochs_phase1 "$PH1" \
         --epochs_phase2 "$PH2" \
         --warmup_steps "$WARMUP" \
         --total_steps "$TOTAL_STEPS" \
         --batch_size "$BS" \
+        --accumulate_grad_batches "$ACCUM" \
         --accelerator "$ACCEL" \
         --devices "$DEVICES" \
         --strategy ddp_find_unused_parameters_true \
