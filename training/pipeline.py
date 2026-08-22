@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import torch
 import wandb
 from torch.utils.data import DataLoader, Subset
 
@@ -125,6 +127,32 @@ def print_global(text, rank=0, string_process_func = None):
         else:
             print(text, flush=True)
 
+
+def _phase1_cache_path(args, tasks, dataset_config):
+    """Return cache file path for Phase-1 head-alignment state_dict.
+
+    Key is a sha1 over the Phase-1-relevant config: backbone, pretrained,
+    image_size, sorted task names, epochs_phase1, head_lr, and the effective
+    batch config (batch_size, max_train_samples). Excludes method and seed —
+    Phase-1 output is identical across methods and seeds for a given backbone.
+    """
+    first_cfg = dataset_config[tasks[0]["name"]]
+    key_dict = {
+        "backbone": getattr(args, "backbone", None),
+        "pretrained": getattr(args, "pretrained", True),
+        "image_size": getattr(args, "image_size", None),
+        "tasks": sorted(t["name"] for t in tasks),
+        "epochs_phase1": args.epochs_phase1,
+        "head_lr": args.head_lr,
+        "batch_size": first_cfg["batch_size"],
+        "max_train_samples": first_cfg["max_train_samples"],
+    }
+    key_str = json.dumps(key_dict, sort_keys=True)
+    key_hash = hashlib.sha1(key_str.encode("utf-8")).hexdigest()
+    data_root = first_cfg.get("data_root", "./data")
+    cache_dir = os.path.join(data_root, "phase1_cache")
+    return os.path.join(cache_dir, f"{key_hash}.pt"), key_dict
+
 def run_sequential_pipeline(args):
     """Full sequential multi-task training pipeline with Nostalgia projection.
 
@@ -135,6 +163,11 @@ def run_sequential_pipeline(args):
 
     # Seed everything for reproducibility
     pl.seed_everything(args.seed, workers=True)
+
+    # TF32 matmul on Ampere+ GPUs for higher throughput (fp32 semantics;
+    # used for forward/backward only — Lanczos HVP in Phase 3 runs outside
+    # autocast and is unaffected by matmul precision).
+    torch.set_float32_matmul_precision("high")
 
     # Detect device and validate quantization
     default_device, quantization = resolve_device_and_quantization(args)
@@ -271,6 +304,32 @@ def run_sequential_pipeline(args):
 
     # Assign model reference to the custom logger so it can access global_step_counter
     wandb_logger.model = model
+
+    # 2b. Phase-1 head-alignment cache lookup — load cached state_dict if
+    # present, then drop all head_align epochs by zeroing args.epochs_phase1
+    # BEFORE the PhaseSchedulerCallback builds its schedule. Cache is keyed
+    # by backbone/image_size/tasks/batch config only (method + seed excluded).
+    args.phase1_cache_path = None  # default: no cache save
+    if getattr(args, "epochs_phase1", 0) > 0 and active_tasks and _is_image_task(active_tasks[0]):
+        cache_path, cache_key = _phase1_cache_path(args, tasks, args.dataset_config)
+        if os.path.exists(cache_path):
+            blob = torch.load(cache_path, map_location="cpu")
+            model.load_state_dict(blob["state_dict"])
+            args.epochs_phase1 = 0  # zero BEFORE callback reads it
+            print_global(
+                f"[Phase-1 cache] HIT: loaded cached heads from {cache_path} "
+                f"(key={json.dumps(cache_key, sort_keys=True)}); "
+                f"epochs_phase1 zeroed, head_align epochs dropped",
+                rank=local_rank,
+            )
+        else:
+            # Record path so PhaseSchedulerCallback saves at end of final head_align epoch.
+            args.phase1_cache_path = cache_path
+            print_global(
+                f"[Phase-1 cache] MISS: will write to {cache_path} "
+                f"after Phase 1 completes",
+                rank=local_rank,
+            )
 
     # 3. Build schedule and single Trainer
     scheduler_callback = PhaseSchedulerCallback(tasks, args)

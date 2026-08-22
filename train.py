@@ -153,6 +153,12 @@ def parse_args():
         help="Validate every N training steps (int) or fraction of an epoch (float)",
     )
     log_group.add_argument("--log_every_n_steps", type=int, default=50)
+    log_group.add_argument(
+        "--val_every_n_epochs",
+        type=int,
+        default=1,
+        help="Phase 2: validate once every N epochs (always validate on last epoch of each task's Phase-2 block)",
+    )
     log_group.add_argument("--wandb_project", type=str, default=None)
     log_group.add_argument("--wandb_name", type=str, default=None)
     log_group.add_argument("--wandb_entity", type=str, default=None)

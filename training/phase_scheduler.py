@@ -15,6 +15,7 @@ backbone has already drifted.
 """
 
 import gc
+import os
 import torch
 import lightning.pytorch as pl
 
@@ -74,6 +75,12 @@ class PhaseSchedulerCallback(pl.Callback):
         self.replay_buffer = None           # baselines.agem.ReplayBuffer
         self.teacher_memory = None          # frozen teacher model for SDFT
 
+        # Phase-1 head-alignment cache (populated by training.pipeline on cache miss).
+        self.phase1_cache_path = getattr(args, "phase1_cache_path", None)
+
+        # Phase-2 validation frequency (1 = every epoch; >1 gates limit_val_batches).
+        self.val_every_n_epochs = max(1, int(getattr(args, "val_every_n_epochs", 1)))
+
     # ------------------------------------------------------------------
     # Batch start: sanity-check that the correct task's data is served
     # ------------------------------------------------------------------
@@ -127,6 +134,12 @@ class PhaseSchedulerCallback(pl.Callback):
             return
 
         task_name, phase, task_idx = self.schedule[epoch]
+
+        # Val-frequency gating runs EVERY Phase-2 epoch (not just on transitions)
+        # so limit_val_batches toggles correctly across epochs within one task.
+        if phase == "nostalgia" and self.val_every_n_epochs > 1:
+            self._apply_val_gating(trainer, epoch, task_name)
+
         task_changed = (task_name != self._prev_task)
         phase_changed = (phase != self._prev_phase)
 
@@ -307,6 +320,19 @@ class PhaseSchedulerCallback(pl.Callback):
             return
 
         task_name, phase, task_idx = self.schedule[epoch]
+
+        # Phase-1 cache save: write state_dict at end of the FINAL head_align
+        # epoch. Only rank 0 writes — DDP ranks share optimizer state so the
+        # post-Phase-1 model is identical across ranks.
+        if phase == "head_align" and self.phase1_cache_path is not None:
+            next_epoch = epoch + 1
+            next_is_head_align = (
+                next_epoch < len(self.schedule)
+                and self.schedule[next_epoch][1] == "head_align"
+            )
+            if not next_is_head_align and trainer.is_global_zero:
+                self._save_phase1_cache(pl_module)
+            # fall through — if phase is head_align, the nostalgia gate below exits
 
         # Only run Phase 3 at the end of a task's Phase 2 block
         if phase != "nostalgia":
@@ -511,6 +537,74 @@ class PhaseSchedulerCallback(pl.Callback):
         elif pl_module.device.type == "mps":
             torch.mps.empty_cache()
         print(f"  SDFT teacher snapshot for task '{task_name}' completed")
+
+    # ------------------------------------------------------------------
+    # Phase-1 head-alignment cache writer
+    # ------------------------------------------------------------------
+    def _save_phase1_cache(self, pl_module):
+        """Atomically write model state_dict after Phase-1 head alignment.
+
+        Heads and BN running stats are both mutated during Phase 1, so save
+        the full state_dict (not just heads). CPU-side dump avoids
+        device-specific pickles.
+        """
+        cache_path = self.phase1_cache_path
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = cache_path + ".tmp"
+        sd = {k: v.detach().cpu() for k, v in pl_module.state_dict().items()}
+        meta = {
+            "backbone": getattr(self.args, "backbone", None),
+            "pretrained": getattr(self.args, "pretrained", True),
+            "image_size": getattr(self.args, "image_size", None),
+            "tasks": sorted(t["name"] for t in self.tasks),
+            "epochs_phase1": getattr(self.args, "epochs_phase1", None),
+        }
+        torch.save({"state_dict": sd, "key": meta}, tmp_path)
+        os.replace(tmp_path, cache_path)
+        print(f"[Phase-1 cache] Saved: {cache_path}\n  key={meta}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Phase-2 validation-every-N-epochs gating
+    # ------------------------------------------------------------------
+    def _ph2_epoch_index(self, epoch):
+        """0-based index of `epoch` within the current task's Phase-2 block."""
+        task_name = self.schedule[epoch][0]
+        idx = 0
+        e = epoch - 1
+        while (
+            e >= 0
+            and self.schedule[e][0] == task_name
+            and self.schedule[e][1] == "nostalgia"
+        ):
+            idx += 1
+            e -= 1
+        return idx
+
+    def _apply_val_gating(self, trainer, epoch, task_name):
+        """Toggle trainer.limit_val_batches based on val_every_n_epochs.
+
+        Always validate on the LAST Phase-2 epoch of a task (task-end metrics
+        stay complete); otherwise only every Nth epoch.
+        """
+        if not hasattr(self, "_saved_limit_val"):
+            # Lazy-capture original value (cache-hit path has no head_align
+            # to populate it, so first Phase-2 epoch provides the baseline).
+            self._saved_limit_val = trainer.limit_val_batches
+
+        next_epoch = epoch + 1
+        is_last_ph2_of_task = (
+            next_epoch >= len(self.schedule)
+            or self.schedule[next_epoch][0] != task_name
+        )
+        if is_last_ph2_of_task:
+            trainer.limit_val_batches = self._saved_limit_val
+            return
+
+        epoch_in_block = self._ph2_epoch_index(epoch)
+        if (epoch_in_block % self.val_every_n_epochs) != 0:
+            trainer.limit_val_batches = 0
+        else:
+            trainer.limit_val_batches = self._saved_limit_val
 
     def _task_index(self, task_name):
         """Return 0-based index of a task name in the schedule's task list."""

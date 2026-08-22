@@ -19,7 +19,8 @@ REPO_DIR="${REPO_DIR:-/workspace/Nostalgia-CL-exp}"
 # RunPod pod: 1 GPU by default. Override if multi-GPU pod.
 export ACCEL="${ACCEL:-gpu}"
 export DEVICES="${DEVICES:-1}"
-export NUM_WORKERS="${NUM_WORKERS:-4}"
+export NUM_WORKERS="${NUM_WORKERS:-8}"
+export PRECISION="${PRECISION:-bf16-mixed}"
 
 BACKBONE="${BACKBONE:-resnet18}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
@@ -47,10 +48,16 @@ else
     fi
 fi
 
-LR="1e-3"
-HEAD_LR="5e-4"
-WEIGHT_DECAY="1e-4"
-GRAD_CLIP="1.0"
+# Per-backbone LR default (env override wins).
+case "$BACKBONE" in
+    vit|siglip)  _lr_default="3e-4" ;;
+    *)           _lr_default="1e-3" ;;
+esac
+
+LR="${LR:-$_lr_default}"
+HEAD_LR="${HEAD_LR:-5e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+GRAD_CLIP="${GRAD_CLIP:-1.0}"
 
 mkdir -p "$WANDB_DIR"
 
@@ -111,6 +118,7 @@ else
         --accumulate_grad_batches 1 \
         --accelerator "$ACCEL" \
         --devices "$DEVICES" \
+        --precision "$PRECISION" \
         --log_every_n_steps 5 \
         --val_check_interval 1.0 \
         --wandb_project "domainnet-cl-smoke" \
@@ -175,6 +183,7 @@ for method in $METHODS; do
         --accumulate_grad_batches "$ACCUM" \
         --accelerator "$ACCEL" \
         --devices "$DEVICES" \
+        --precision "$PRECISION" \
         --log_every_n_steps "$LOG_EVERY" \
         --val_check_interval 1.0 \
         --wandb_project "domainnet-cl" \
