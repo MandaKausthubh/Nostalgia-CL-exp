@@ -168,6 +168,8 @@ def run_sequential_pipeline(args):
     # used for forward/backward only — Lanczos HVP in Phase 3 runs outside
     # autocast and is unaffected by matmul precision).
     torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  # fixed image size → autotune conv algos
 
     # Detect device and validate quantization
     default_device, quantization = resolve_device_and_quantization(args)

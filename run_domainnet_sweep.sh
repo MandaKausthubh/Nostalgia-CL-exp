@@ -10,6 +10,8 @@ set -euo pipefail
 #       bash run_domainnet_sweep.sh
 #   DATA_ROOT_DN=/workspace/data/domainnet bash run_domainnet_sweep.sh
 #   BS_SIGLIP=32 PH2=10 bash run_domainnet_sweep.sh   # per-backbone / per-budget knobs
+#   GPU_MODE=per_gpu bash run_domainnet_sweep.sh      # 4 concurrent single-GPU runs (faster sweep)
+#   LR_VIT=1e-4 WARMUP_VIT=800 bash run_domainnet_sweep.sh   # per-backbone hyperparam override
 #
 # Loop order (per spec): methods → backbones → seeds; tasks fixed per run.
 
@@ -161,92 +163,183 @@ echo "  Methods:    ${METHODS[*]}  (${#METHODS[@]})"
 echo "  Backbones:  ${BACKBONES[*]}  (${#BACKBONES[@]})"
 echo "  Seeds:      $SEEDS  ($_n_seeds)"
 echo "  Tasks:      ${TASKS[*]}"
-echo "  Devices:    $DEVICES × $ACCEL"
+echo "  Devices:    $DEVICES × $ACCEL   (GPU_MODE=${GPU_MODE:-ddp})"
 echo "  Total runs: $_total_runs  (each = 6 sequential domains)"
 echo "====================================================================="
 
+# ----- Multi-GPU execution mode ------------------------------------------
+# GPU_MODE=ddp     : one run at a time, DDP across all GPUs (lower throughput
+#                    due to sync overhead + per-rank Hessian duplication, but
+#                    Phase-3 Lanczos shards across ranks → faster per run).
+# GPU_MODE=per_gpu : DEVICES concurrent single-GPU runs (one per GPU, no DDP
+#                    sync). Grad-accum is scaled ×DEVICES to preserve the
+#                    effective batch size. Phase-3 runs single-rank (slower
+#                    per run) but ~DEVICES× overall sweep throughput.
+GPU_MODE="${GPU_MODE:-ddp}"
+PER_GPU_WORKERS="${PER_GPU_WORKERS:-4}"   # dataloader workers per run in per_gpu mode
+LOG_DIR="${LOG_DIR:-./sweep_logs}"
+
+# ----- Run one (method, backbone, seed) config --------------------------------
+# Args: method backbone seed devices strategy accum_mult gpu_id run_idx
+_run_one() {
+    local method="$1" backbone="$2" seed="$3"
+    local devices="$4" strategy="$5" accum_mult="$6" gpu_id="$7" run_idx="$8"
+
+    local image_size="${IMG_SIZE[$backbone]}"
+    local bs="${BS_DEFAULT[$backbone]}"
+    local accum=$(( ${ACCUM_DEFAULT[$backbone]} * accum_mult ))
+    local lr="${LR_MAP[$backbone]}"
+    local head_lr="${HEAD_LR_MAP[$backbone]}"
+    local warmup="${WARMUP_MAP[$backbone]}"
+    local total_steps="${TOTAL_STEPS_MAP[$backbone]}"
+    local weight_decay="${WD_MAP[$backbone]}"
+    local grad_clip="${GC_MAP[$backbone]}"
+    local ph1="${PH1_MAP[$backbone]}"
+    local ph2="${PH2_MAP[$backbone]}"
+    local val_epochs="${VAL_EPOCHS_MAP[$backbone]}"
+    local workers="$NUM_WORKERS"
+    [ -n "$gpu_id" ] && workers="$PER_GPU_WORKERS"
+
+    local exp_name="domainnet_${backbone}_${method}_seed${seed}_fullft"
+
+    # Per-method extras.
+    local extra_args="--base_optimizer adamw --lr $lr --head_lr $head_lr --weight_decay $weight_decay --grad_clip_val $grad_clip --seed $seed"
+    if [ "$method" = "nostalgia" ] || [ "$method" = "gpm" ] || [ "$method" = "ewc_nostalgia" ]; then
+        extra_args="${extra_args} --k 64 --nostalgia_accumulation_rounds 5 --nostalgia_max_hessian_batch 32 --nostalgia_num_samples 2000"
+    fi
+    if [ "$method" = "ewc" ] || [ "$method" = "ewc_nostalgia" ]; then
+        extra_args="${extra_args} --ewc_lambda 400.0"
+    fi
+    if [ "$method" = "agem" ]; then
+        extra_args="${extra_args} --agem_mem_size 2000"
+    fi
+    if [ "$method" = "sdft" ]; then
+        extra_args="${extra_args} --sdft_lambda_distillation 1.0 --sdft_temperature 2.0"
+    fi
+
+    local strategy_args=()
+    if [ -n "$strategy" ]; then
+        strategy_args=(--strategy "$strategy")
+    fi
+
+    echo ""
+    echo "---------------------------------------------------------------------"
+    echo "[$run_idx/$_total_runs]  backbone=$backbone  method=$method  seed=$seed  gpu=${gpu_id:-all}"
+    echo "  exp_name    = $exp_name"
+    echo "  image_size  = $image_size"
+    echo "  bs/accum    = $bs / $accum  (eff=${bs}×${accum}×${devices}=$((bs * accum * devices)))"
+    echo "  lr/head_lr  = $lr / $head_lr"
+    echo "  warmup/tot  = $warmup / $total_steps"
+    echo "  ph1/ph2     = $ph1 / $ph2"
+    echo "  wd/clip     = $weight_decay / $grad_clip"
+    echo "  val_every   = $val_epochs epochs  (val_check_interval=$VAL_EVERY)"
+    echo "---------------------------------------------------------------------"
+
+    if [ -n "$gpu_id" ]; then
+        # Single-GPU run pinned to one device; log to per-run file.
+        CUDA_VISIBLE_DEVICES="$gpu_id" python train.py \
+            --backbone "$backbone" \
+            --image_size "$image_size" \
+            --tasks "${TASKS[@]}" \
+            --method "$method" \
+            --data_root "$DATA_ROOT_DN" \
+            --data_root_domainnet "$DATA_ROOT_DN" \
+            --max_length 32 \
+            --num_workers "$workers" \
+            --pin_memory \
+            --epochs_phase1 "$ph1" \
+            --epochs_phase2 "$ph2" \
+            --warmup_steps "$warmup" \
+            --total_steps "$total_steps" \
+            --batch_size "$bs" \
+            --accumulate_grad_batches "$accum" \
+            --accelerator "$ACCEL" \
+            --devices 1 \
+            --precision "$PRECISION" \
+            --log_every_n_steps "$LOG_EVERY" \
+            --val_check_interval "$VAL_EVERY" \
+            --val_every_n_epochs "$val_epochs" \
+            --wandb_project "$WANDB_PROJECT" \
+            --wandb_name "$exp_name" \
+            $extra_args \
+            > "$LOG_DIR/${exp_name}.log" 2>&1
+    else
+        python train.py \
+            --backbone "$backbone" \
+            --image_size "$image_size" \
+            --tasks "${TASKS[@]}" \
+            --method "$method" \
+            --data_root "$DATA_ROOT_DN" \
+            --data_root_domainnet "$DATA_ROOT_DN" \
+            --max_length 32 \
+            --num_workers "$workers" \
+            --pin_memory \
+            --epochs_phase1 "$ph1" \
+            --epochs_phase2 "$ph2" \
+            --warmup_steps "$warmup" \
+            --total_steps "$total_steps" \
+            --batch_size "$bs" \
+            --accumulate_grad_batches "$accum" \
+            --accelerator "$ACCEL" \
+            --devices "$devices" \
+            "${strategy_args[@]}" \
+            --precision "$PRECISION" \
+            --log_every_n_steps "$LOG_EVERY" \
+            --val_check_interval "$VAL_EVERY" \
+            --val_every_n_epochs "$val_epochs" \
+            --wandb_project "$WANDB_PROJECT" \
+            --wandb_name "$exp_name" \
+            $extra_args
+    fi
+    echo "Finished: $exp_name"
+}
+
 # ----- Sweep ------------------------------------------------------------
-_run_idx=0
+mkdir -p "$LOG_DIR"
+
+# Flatten job list.
+JOBS=()
 for method in "${METHODS[@]}"; do
     for backbone in "${BACKBONES[@]}"; do
-        image_size="${IMG_SIZE[$backbone]}"
-        bs="${BS_DEFAULT[$backbone]}"
-        accum="${ACCUM_DEFAULT[$backbone]}"
-        lr="${LR_MAP[$backbone]}"
-        head_lr="${HEAD_LR_MAP[$backbone]}"
-        warmup="${WARMUP_MAP[$backbone]}"
-        total_steps="${TOTAL_STEPS_MAP[$backbone]}"
-        weight_decay="${WD_MAP[$backbone]}"
-        grad_clip="${GC_MAP[$backbone]}"
-        ph1="${PH1_MAP[$backbone]}"
-        ph2="${PH2_MAP[$backbone]}"
-        val_epochs="${VAL_EPOCHS_MAP[$backbone]}"
-
         for seed in $SEEDS; do
-            _run_idx=$((_run_idx + 1))
-            exp_name="domainnet_${backbone}_${method}_seed${seed}_fullft"
-
-            # Per-method extras.
-            extra_args="--base_optimizer adamw --lr $lr --head_lr $head_lr --weight_decay $weight_decay --grad_clip_val $grad_clip --seed $seed"
-            if [ "$method" = "nostalgia" ] || [ "$method" = "gpm" ] || [ "$method" = "ewc_nostalgia" ]; then
-                # GPU-safe null-space / GPM subspace estimation.
-                extra_args="${extra_args} --k 64 --nostalgia_accumulation_rounds 5 --nostalgia_max_hessian_batch 32 --nostalgia_num_samples 2000"
-            fi
-            if [ "$method" = "ewc" ] || [ "$method" = "ewc_nostalgia" ]; then
-                extra_args="${extra_args} --ewc_lambda 400.0"
-            fi
-            if [ "$method" = "agem" ]; then
-                extra_args="${extra_args} --agem_mem_size 2000"
-            fi
-            if [ "$method" = "sdft" ]; then
-                extra_args="${extra_args} --sdft_lambda_distillation 1.0 --sdft_temperature 2.0"
-            fi
-
-            echo ""
-            echo "---------------------------------------------------------------------"
-            echo "[$_run_idx/$_total_runs]  backbone=$backbone  method=$method  seed=$seed"
-            echo "  exp_name    = $exp_name"
-            echo "  image_size  = $image_size"
-            echo "  bs/accum    = $bs / $accum  (eff=${bs}×${accum}×${DEVICES}=$((bs * accum * DEVICES)))"
-            echo "  lr/head_lr  = $lr / $head_lr"
-            echo "  warmup/tot  = $warmup / $total_steps"
-            echo "  ph1/ph2     = $ph1 / $ph2"
-            echo "  wd/clip     = $weight_decay / $grad_clip"
-            echo "  val_every   = $val_epochs epochs  (val_check_interval=$VAL_EVERY)"
-            echo "  tasks       = ${TASKS[*]}"
-            echo "---------------------------------------------------------------------"
-
-            python train.py \
-                --backbone "$backbone" \
-                --image_size "$image_size" \
-                --tasks "${TASKS[@]}" \
-                --method "$method" \
-                --data_root "$DATA_ROOT_DN" \
-                --data_root_domainnet "$DATA_ROOT_DN" \
-                --max_length 32 \
-                --num_workers "$NUM_WORKERS" \
-                --pin_memory \
-                --epochs_phase1 "$ph1" \
-                --epochs_phase2 "$ph2" \
-                --warmup_steps "$warmup" \
-                --total_steps "$total_steps" \
-                --batch_size "$bs" \
-                --accumulate_grad_batches "$accum" \
-                --accelerator "$ACCEL" \
-                --devices "$DEVICES" \
-                --strategy "$STRATEGY" \
-                --precision "$PRECISION" \
-                --log_every_n_steps "$LOG_EVERY" \
-                --val_check_interval "$VAL_EVERY" \
-                --val_every_n_epochs "$val_epochs" \
-                --wandb_project "$WANDB_PROJECT" \
-                --wandb_name "$exp_name" \
-                $extra_args
-
-            echo "Finished: $exp_name"
+            JOBS+=("${method}|${backbone}|${seed}")
         done
     done
 done
+
+if [ "$GPU_MODE" = "per_gpu" ]; then
+    echo "GPU_MODE=per_gpu: launching $DEVICES concurrent single-GPU runs per wave."
+    echo "Logs: $LOG_DIR/<exp_name>.log"
+    _job_idx=0
+    _run_idx=0
+    while [ "$_job_idx" -lt "${#JOBS[@]}" ]; do
+        _pids=()
+        _names=()
+        for (( g=0; g<DEVICES && _job_idx<${#JOBS[@]}; g++, _job_idx++ )); do
+            _run_idx=$((_run_idx + 1))
+            IFS='|' read -r _m _b _s <<< "${JOBS[$_job_idx]}"
+            _exp="domainnet_${_b}_${_m}_seed${_s}_fullft"
+            _run_one "$_m" "$_b" "$_s" 1 "" "$DEVICES" "$g" "$_run_idx" &
+            _pids+=($!)
+            _names+=("$_exp")
+        done
+        # Wait for wave; report failures without aborting the sweep.
+        for i in "${!_pids[@]}"; do
+            if wait "${_pids[$i]}"; then
+                echo "[wave done] ${_names[$i]}  OK"
+            else
+                echo "[wave done] ${_names[$i]}  FAILED (see $LOG_DIR/${_names[$i]}.log)"
+            fi
+        done
+    done
+else
+    _run_idx=0
+    for job in "${JOBS[@]}"; do
+        _run_idx=$((_run_idx + 1))
+        IFS='|' read -r _m _b _s <<< "$job"
+        _run_one "$_m" "$_b" "$_s" "$DEVICES" "$STRATEGY" 1 "" "$_run_idx"
+    done
+fi
 
 echo "====================================================================="
 echo "All $_total_runs DomainNet runs completed."
