@@ -230,6 +230,7 @@ def run_sequential_pipeline(args):
             nostalgia_alpha=getattr(args, "nostalgia_alpha", 1.0),
             backbone_name=getattr(args, "backbone", "resnet10"),
             image_size=getattr(args, "image_size", 32),
+            pretrained=getattr(args, "pretrained", True),
             sdft_lambda_distillation=getattr(args, "sdft_lambda_distillation", 1.0),
             sdft_temperature=getattr(args, "sdft_temperature", 2.0),
         )

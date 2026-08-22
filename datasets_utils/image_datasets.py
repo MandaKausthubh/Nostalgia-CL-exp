@@ -111,6 +111,9 @@ def _build_image_transform(in_channels: int, image_size: int = 32):
         tfs.append(transforms.Grayscale(num_output_channels=3))
     tfs.append(transforms.Resize((image_size, image_size)))
     tfs.append(transforms.ToTensor())
+    # ImageNet normalization — required when using ImageNet-pretrained backbones.
+    tfs.append(transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                    std=[0.229, 0.224, 0.225]))
     return transforms.Compose(tfs)
 
 

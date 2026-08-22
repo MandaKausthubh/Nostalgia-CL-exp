@@ -34,18 +34,24 @@ for task in Tasks:
 
 ## Current Details:
 - The optimizer itself is implemented in `utils/nostalgia.py`.
-- The model has been implemented in `./models_utils/language_model.py` and `./models_utils/nostalgia_optimizer.py`.
-- Datasets we are experimenting with datasets such as SST-2, AG-news, Trec and DB-pedia. (all classification datasets).
-- datasets are implemented in `./datasets_utils/*`.
+- `train.py` is the single unified CLI entry point for BOTH text and image tasks (task names dispatch the pipeline).
+- Text model: `./models_utils/language_model.py` + `./models_utils/nostalgia_optimizer.py`.
+- Image model: `./models_utils/image_model.py` (`ImageModelModule`; backbones ResNet-10/18, ViT-B/16, SigLIP-B/16 via `--backbone`).
+- Text datasets (SST-2, AG-news, Trec, DB-pedia; also FLAN/SQuAD utilities) in `./datasets_utils/*`.
+- Image datasets (CIFAR-10/100, MNIST, Split-CIFAR100, Split-TinyImageNet, ImageNet-100, DomainNet) in `./datasets_utils/image_datasets.py` (`IMAGE_TASK_REGISTRY`).
+- `config.py` merges `TEXT_TASK_REGISTRY` + `IMAGE_TASK_REGISTRY` into one `TASK_REGISTRY`.
+- Legacy CNN experiment code remains in `testing/` (`cnn_model.py`, `cnn_datasets.py`); superseded by the unified pipeline.
 
 ## Tech stack to be used:
 - pytorch lightning + pytorch
-- Training device is a TPU (although for local testing keep using GPU or MPS)
-- Multi-TPU setup is the main one in which I'm training of TPUV5e x8.
+- Local testing: GPU or MPS (`--accelerator mps --devices 1`)
+- Main training targets: TPU v5e x8 (`--accelerator tpu --strategy xla`) and RunPod multi-GPU (4× A100, `--accelerator gpu --strategy ddp_find_unused_parameters_true`)
+- `setup_pod.sh` provisions a fresh RunPod pod; `run_pod_full.sh` (single-GPU) and `run_domainnet_sweep.sh` (multi-GPU ICLR sweep: methods × backbones × seeds) are the production runners.
 
 ## What I want:
 - Modular setup where I can pick:
     - Model (Qwen2.5, Gpt-2, tiny-gpt)
+    - Image backbone (resnet10, resnet18, vit, siglip) + image size
     - LoRA (alpha, rank, dropout)
     - quantization
     - learning rate for backbone
@@ -89,13 +95,22 @@ for task in Tasks:
 
 ## Implementation Plan:
 
-## Comparison Baselines
-3 continual-learning baselines compared against Nostalgia:
-- **GPM** (Gradient Projection Memory) — same null-space projection family, gradient-based subspace. Direct competitor.
-- **EWC** (Elastic Weight Consolidation) — Fisher-diagonal regularization penalty. Classic baseline.
-- **A-GEM** (Average Gradient Episodic Memory) — replay buffer with gradient angle projection. Memory-based baseline.
+## Methods
+7 methods selected via `--method {nostalgia,naive_adam,ewc,gpm,agem,ewc_nostalgia,sdft}`:
+- **Nostalgia** — Hessian (Lanczos) null-space gradient projection. `--nostalgia_alpha` controls soft vs hard projection.
+- **naive_adam** — raw base optimizer, no protection.
+- **GPM** (Gradient Projection Memory) — same null-space projection family, gradient-based subspace. Reuses the Nostalgia projection wrapper; only Q construction differs.
+- **EWC** (Elastic Weight Consolidation) — Fisher-diagonal regularization penalty.
+- **A-GEM** (Average Gradient Episodic Memory) — replay buffer with gradient angle projection.
+- **EWC+Nostalgia** (`ewc_nostalgia`) — hybrid: low-rank Hessian quadratic penalty `lam * Q Λ Qᵀ (θ − θ*)` injected into grads (`baselines/ewc_nostalgia.py`, `--ewc_nostalgia_lambda`).
+- **SDFT** (Self-Distillation Fine-Tuning) — frozen teacher snapshot from previous task, KL distillation added during full finetuning (image pipeline).
 
-Implemented in `baselines/` package. Selected via `--method {nostalgia,naive_adam,ewc,gpm,agem}`.
-GPM reuses the Nostalgia projection wrapper; only Q construction differs.
-EWC and A-GEM add their own optimizer wrappers (parallel to NostalgiaOptimizer).
-Per-task state (Fisher / replay buffer / subspace) computed in PhaseSchedulerCallback.on_train_epoch_end.
+Implemented in `baselines/` package.
+EWC, A-GEM, SDFT and EWC+Nostalgia add their own optimizer wrappers (parallel to NostalgiaOptimizer).
+Per-task state (Fisher / replay buffer / subspace / teacher) computed in PhaseSchedulerCallback.on_train_epoch_end.
+
+## Run scripts
+- `run_pod_full.sh` — RunPod single-GPU DomainNet run (sanity → smoke → full sweep). Env overrides: `TASKS`, `METHODS`, `BACKBONE`, `MODE=smoke|full`.
+- `run_domainnet_sweep.sh` — full ICLR sweep: 7 methods × {resnet18, vit, siglip} × 3 seeds over the 6 DomainNet domains. Env overrides for every axis (`SEEDS`, `BACKBONES`, `METHODS`, `BS_*`, `PH2`, ...).
+- `run_cnn_benchmarks.sh`, `run_image_benchmarks.sh`, `run_tiny_imagenet_benchmarks.sh`, `run_kaggle_domainnet_benchmarks.sh` — older per-benchmark runners (some still reference legacy `testing/train_cnn.py`).
+- `run_full_llm_cl.sh`, `run_smoke_llm_cl.sh`, `run_full_resnet10_cl.sh` — LLM and ResNet-10 runners.

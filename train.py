@@ -31,6 +31,10 @@ def parse_args():
                              help="Image encoder backbone (only used for image tasks)")
     model_group.add_argument("--image_size", type=int, default=None,
                              help="Input image size (default: 32 for ResNets, 224 for ViT/SigLIP)")
+    model_group.add_argument("--pretrained", dest="pretrained", action="store_true", default=True,
+                             help="Use ImageNet-pretrained weights for resnet18/vit (default: on)")
+    model_group.add_argument("--no-pretrained", dest="pretrained", action="store_false",
+                             help="Train image backbone from random init")
     model_group.add_argument("--use_lora", action="store_true")
     model_group.add_argument("--lora_r", type=int, default=8)
     model_group.add_argument("--lora_alpha", type=int, default=16)

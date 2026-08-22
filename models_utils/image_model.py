@@ -107,11 +107,13 @@ class ResNet10(nn.Module):
 class ResNet18(nn.Module):
     """ResNet-18 backbone for images, Hessian-safe (AvgPool2d replaces MaxPool2d)."""
 
-    def __init__(self, in_channels: int = 3, weights=None):
+    def __init__(self, in_channels: int = 3, weights="DEFAULT"):
         super().__init__()
         self.in_channels = in_channels
         self.feat_dim = 512
 
+        if weights == "DEFAULT":
+            weights = models.ResNet18_Weights.IMAGENET1K_V1
         net = models.resnet18(weights=weights)
         net.maxpool = nn.AvgPool2d(kernel_size=3, stride=2, padding=1)
         net.fc = nn.Identity()
@@ -131,8 +133,10 @@ class ResNet18(nn.Module):
 class ViTBackbone(nn.Module):
     """ViT-B/16 backbone from torchvision, returning the CLS token."""
 
-    def __init__(self, weights=None):
+    def __init__(self, weights="DEFAULT"):
         super().__init__()
+        if weights == "DEFAULT":
+            weights = models.ViT_B_16_Weights.IMAGENET1K_V1
         self.vit = models.vit_b_16(weights=weights)
         self.vit.heads = nn.Identity()
         self.feat_dim = 768
@@ -156,17 +160,19 @@ class SigLIPBackbone(nn.Module):
         return out.pooler_output
 
 
-def _build_image_backbone(name: str, in_channels: int = 3, feat_dim: int = 512):
+def _build_image_backbone(name: str, in_channels: int = 3, feat_dim: int = 512,
+                          pretrained: bool = True):
     """Factory: return (backbone, feat_dim) for the requested image backbone."""
     name = name.lower()
+    weights = "DEFAULT" if pretrained else None
     if name == "resnet10":
         backbone = ResNet10(in_channels=in_channels, feat_dim=feat_dim)
         return backbone, backbone.feat_dim
     if name == "resnet18":
-        backbone = ResNet18(in_channels=in_channels)
+        backbone = ResNet18(in_channels=in_channels, weights=weights)
         return backbone, backbone.feat_dim
     if name == "vit":
-        backbone = ViTBackbone()
+        backbone = ViTBackbone(weights=weights)
         return backbone, backbone.feat_dim
     if name == "siglip":
         backbone = SigLIPBackbone()
@@ -204,6 +210,7 @@ class ImageModelModule(pl.LightningModule):
         nostalgia_alpha: float = 1.0,
         backbone_name: str = "resnet10",
         image_size: int = 32,
+        pretrained: bool = True,
         sdft_lambda_distillation: float = 1.0,
         sdft_temperature: float = 2.0,
     ):
@@ -215,7 +222,8 @@ class ImageModelModule(pl.LightningModule):
         self.image_size = image_size
 
         self.backbone, actual_feat_dim = _build_image_backbone(
-            backbone_name, in_channels=in_channels, feat_dim=feat_dim
+            backbone_name, in_channels=in_channels, feat_dim=feat_dim,
+            pretrained=pretrained,
         )
 
         if tasks_config is not None:
