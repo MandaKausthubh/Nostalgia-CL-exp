@@ -6,14 +6,14 @@ set -euo pipefail
 #   DATA_ROOT_DN=/path/to/domainnet bash run_image_benchmarks.sh
 
 ACCEL="${ACCEL:-gpu}"
-DEVICES="${DEVICES:-2}"
+DEVICES="${DEVICES:-4}"
 
-# Full training budget for DomainNet.
-PH1="20"            # head-alignment epochs per domain
-PH2="40"            # full-finetuning epochs per domain
-WARMUP="500"        # linear-warmup steps
-TOTAL_STEPS="10000" # scheduler horizon per full-finetuning domain
-LR="1e-3"           # ResNet-18 full FT
+# Reduced training budget for ICLR deadline (4x A100).
+PH1="5"             # head-alignment epochs per domain
+PH2="15"            # full-finetuning epochs per domain
+WARMUP="400"        # linear-warmup steps
+TOTAL_STEPS="3000"  # scheduler horizon per full-finetuning domain
+LR="1e-3"           # ResNet-18 / ViT-B/16 full FT
 HEAD_LR="5e-4"
 WEIGHT_DECAY="1e-4"
 GRAD_CLIP="1.0"
@@ -27,19 +27,19 @@ BACKBONE="${BACKBONE:-resnet18}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 
-# Per-GPU batch size: bigger backbones need smaller batches on T4.
+# Per-GPU batch size: 4x A100 (80GB) — saturate all GPUs.
 if [ -z "${BS:-}" ]; then
     if [ "$BACKBONE" = "vit" ] || [ "$BACKBONE" = "siglip" ]; then
-        BS="32"
+        BS="96"
     else
-        BS="128"
+        BS="384"
     fi
 fi
 
-# Gradient accumulation to keep effective batch large for big backbones.
+# Gradient accumulation: effective batch 4x larger (1024 ViT, 1536 ResNet).
 if [ -z "${ACCUM:-}" ]; then
     if [ "$BACKBONE" = "vit" ] || [ "$BACKBONE" = "siglip" ]; then
-        ACCUM="4"
+        ACCUM="2"
     else
         ACCUM="1"
     fi
@@ -50,7 +50,7 @@ TASKS=(
     "domainnet_quickdraw" "domainnet_real" "domainnet_sketch"
 )
 
-METHODS=(
+ALL_METHODS=(
     "naive_adam"
     "nostalgia"
     "ewc"
@@ -59,6 +59,16 @@ METHODS=(
     "ewc_nostalgia"
     "sdft"
 )
+
+# Override subset via env: METHODS="nostalgia naive_adam" bash run_image_benchmarks.sh
+if [ -n "${METHODS:-}" ]; then
+    METHODS=()
+    for m in $METHODS; do
+        METHODS+=("$m")
+    done
+else
+    METHODS=("${ALL_METHODS[@]}")
+fi
 
 for method in "${METHODS[@]}"; do
     exp_name="domainnet_split_${BACKBONE}_${method}_fullft"
