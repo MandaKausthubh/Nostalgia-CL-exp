@@ -40,7 +40,7 @@ if [ "$MODE" = "smoke" ]; then
     TASKS="domainnet_clipart domainnet_real"
     METHODS="nostalgia naive_adam"
 else
-    PH1=3; PH2=5; WARMUP=100; TOTAL_STEPS=1000; LOG_EVERY=50
+    PH1=3; PH2=5; WARMUP=100; TOTAL_STEPS=1000; LOG_EVERY=5
     if [ "$BACKBONE" = "vit" ] || [ "$BACKBONE" = "siglip" ]; then
         BS=64; ACCUM=2
     else
