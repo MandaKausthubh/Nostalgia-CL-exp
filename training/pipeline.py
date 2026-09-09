@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import torch
 import wandb
 from torch.utils.data import DataLoader, Subset
@@ -15,6 +16,111 @@ import lightning.pytorch as pl
 from training.phases import SimpleProgressBar
 from training.phase_scheduler import PhaseSchedulerCallback
 from training.switching_dataloader import SequentialTaskDataModule
+
+
+def _checkpoint_domain(task_name):
+    """Use the dataset task as the domain, stripping the DomainNet prefix."""
+    return task_name.removeprefix("domainnet_")
+
+
+class HuggingFaceTaskCheckpointCallback(pl.Callback):
+    """Save and optionally upload the model after each completed task."""
+
+    def __init__(self, args, is_image):
+        super().__init__()
+        self.args = args
+        self.is_image = is_image
+        self.uploaded_tasks = set()
+
+    def _repo_name(self, task_name):
+        model_name = (
+            getattr(self.args, "backbone", "image")
+            if self.is_image else self.args.model_name
+        )
+        model_name = model_name.rsplit("/", 1)[-1]
+        raw_name = f"{model_name}_{self.args.method}_{_checkpoint_domain(task_name)}"
+        return re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip("-")
+
+    def _save_checkpoint(self, pl_module, task_name):
+        checkpoint_dir = os.path.abspath(
+            os.path.join(self.args.checkpoint_dir, self._repo_name(task_name))
+        )
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        state_dict = {
+            name: value.detach().cpu()
+            for name, value in pl_module.state_dict().items()
+        }
+        torch.save(state_dict, os.path.join(checkpoint_dir, "lightning_state_dict.pt"))
+        with open(os.path.join(checkpoint_dir, "checkpoint_config.json"), "w") as config_file:
+            json.dump({
+                "task": task_name,
+                "model_name": getattr(self.args, "model_name", None),
+                "backbone": getattr(self.args, "backbone", None),
+                "method": self.args.method,
+                "domain": _checkpoint_domain(task_name),
+            }, config_file, indent=2)
+
+        # Preserve native Transformers/PEFT loading for text checkpoints.
+        if not self.is_image and hasattr(pl_module, "model"):
+            pl_module.model.save_pretrained(checkpoint_dir)
+            tokenizer = getattr(pl_module, "tokenizer_instance", None)
+            if tokenizer is not None:
+                tokenizer.save_pretrained(checkpoint_dir)
+        return checkpoint_dir
+
+    def _upload(self, checkpoint_dir, task_name):
+        from huggingface_hub import HfApi
+
+        namespace = getattr(self.args, "hf_hub_namespace", None)
+        if not namespace:
+            raise ValueError(
+                "--push_to_hub requires --hf_hub_namespace or HF_USERNAME/HF_ORG"
+            )
+        repo_id = f"{namespace}/{self._repo_name(task_name)}"
+        api = HfApi()
+        api.create_repo(
+            repo_id=repo_id,
+            repo_type="model",
+            private=getattr(self.args, "hf_hub_private", False),
+            exist_ok=True,
+        )
+        api.upload_folder(
+            repo_id=repo_id,
+            repo_type="model",
+            folder_path=checkpoint_dir,
+            commit_message=f"Checkpoint after task {task_name}",
+        )
+        return repo_id
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        scheduler = next(
+            (callback for callback in trainer.callbacks
+             if isinstance(callback, PhaseSchedulerCallback)),
+            None,
+        )
+        if scheduler is None or epoch >= len(scheduler.schedule):
+            return
+
+        task_name, phase, _ = scheduler.schedule[epoch]
+        next_epoch = epoch + 1
+        is_task_end = (
+            phase == "nostalgia"
+            and (next_epoch >= len(scheduler.schedule)
+                 or scheduler.schedule[next_epoch][0] != task_name)
+        )
+        if not is_task_end or task_name in self.uploaded_tasks:
+            return
+
+        if trainer.is_global_zero:
+            checkpoint_dir = self._save_checkpoint(pl_module, task_name)
+            print(f"[Checkpoint] Saved task '{task_name}' to {checkpoint_dir}", flush=True)
+            if getattr(self.args, "push_to_hub", False):
+                repo_id = self._upload(checkpoint_dir, task_name)
+                print(f"[Checkpoint] Pushed task '{task_name}' to {repo_id}", flush=True)
+            self.uploaded_tasks.add(task_name)
+
+        trainer.strategy.barrier("task_checkpoint")
 
 
 def _parse_dataset_overrides(value):
@@ -359,6 +465,10 @@ def run_sequential_pipeline(args):
     if isinstance(val_check_interval, int) and val_check_interval > effective_batches:
         val_check_interval = effective_batches
 
+    checkpoint_callback = HuggingFaceTaskCheckpointCallback(
+        args=args,
+        is_image=_is_image,
+    )
     trainer = pl.Trainer(
         max_epochs=total_epochs,
         accelerator=args.accelerator,
@@ -372,7 +482,7 @@ def run_sequential_pipeline(args):
         logger=wandb_logger,
         log_every_n_steps=args.log_every_n_steps,
         val_check_interval=val_check_interval,
-        callbacks=[SimpleProgressBar(), scheduler_callback],
+        callbacks=[SimpleProgressBar(), scheduler_callback, checkpoint_callback],
     )
 
     # 4. Single fit() — all task/phase switching happens in the callback

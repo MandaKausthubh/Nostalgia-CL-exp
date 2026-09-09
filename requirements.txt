@@ -5,6 +5,7 @@ datasets>=2.14
 peft>=0.7
 bitsandbytes>=0.41
 wandb>=0.16
+huggingface_hub>=0.20
 tqdm
 torchvision
 Pillow
