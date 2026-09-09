@@ -23,7 +23,13 @@ VAL_EVERY="1.0"     # validate once per epoch
 # Default DomainNet root. Point at folder containing the `domainnet` subfolder.
 DATA_ROOT_DN="${DATA_ROOT_DN:-/kaggle/input/datasets/kausthubhmanda/domainnet-fulldataset}"
 
-BACKBONE="${BACKBONE:-resnet18}"
+# Per-task checkpointing. Set PUSH_TO_HUB=1 to upload each task checkpoint.
+PUSH_TO_HUB="${PUSH_TO_HUB:-0}"
+HF_HUB_NAMESPACE="${HF_HUB_NAMESPACE:-${HF_USERNAME:-${HF_ORG:-}}}"
+HF_HUB_PRIVATE="${HF_HUB_PRIVATE:-0}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-./checkpoints}"
+
+BACKBONE="${BACKBONE:-vit}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 
@@ -88,6 +94,17 @@ for method in "${METHODS[@]}"; do
         extra_args="${extra_args} --sdft_lambda_distillation 1.0 --sdft_temperature 2.0"
     fi
 
+    checkpoint_args=(--checkpoint_dir "$CHECKPOINT_DIR")
+    if [ "$PUSH_TO_HUB" = "1" ] || [ "$PUSH_TO_HUB" = "true" ]; then
+        checkpoint_args+=(--push_to_hub)
+        if [ -n "$HF_HUB_NAMESPACE" ]; then
+            checkpoint_args+=(--hf_hub_namespace "$HF_HUB_NAMESPACE")
+        fi
+        if [ "$HF_HUB_PRIVATE" = "1" ] || [ "$HF_HUB_PRIVATE" = "true" ]; then
+            checkpoint_args+=(--hf_hub_private)
+        fi
+    fi
+
     echo "====================================================================="
     echo "Running: backbone=$BACKBONE  method=$method  tasks=${TASKS[*]}"
     echo "====================================================================="
@@ -115,7 +132,8 @@ for method in "${METHODS[@]}"; do
         --val_check_interval "$VAL_EVERY" \
         --wandb_project "domainnet-cl" \
         --wandb_name "$exp_name" \
-        $extra_args
+        $extra_args \
+        "${checkpoint_args[@]}"
 
     echo ""
     echo "Finished: $exp_name"
