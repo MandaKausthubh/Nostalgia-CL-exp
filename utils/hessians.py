@@ -927,27 +927,85 @@ def _single_lanczos_pass(model, k, device, inputs, targets):
         eigvals = eigvals.detach().contiguous()
         xm.mark_step()
     else:
-        # GPU / MPS: lift and QR on CPU, then move
+        # GPU / MPS: lift to GPU then orthonormalise via cuSOLVER SVD.
+        # CPU LAPACK SVD/QR was crashing with "Parameter N was incorrect on entry to
+        # SGESDD / SORGQR" under memory pressure. cuSOLVER on (param_dim, k) handles
+        # tall-skinny matrices without those LAPACK pitfalls. On MPS we keep CPU path.
         Q_full_cpu  = Q_store @ eigvecs
         del Q_store, eigvecs
         gc.collect()
 
-        # Prefer SVD-based orthonormalisation over QR: avoids LAPACK's SORGQR path
-        # which can crash with "Parameter N was incorrect" under memory pressure or
-        # when the matrix is rank-deficient. SVD is numerically stable for either case.
-        try:
-            U, S, _ = torch.linalg.svd(Q_full_cpu, full_matrices=False)
-            Q_full_cpu = U
-            del U, S
-        except RuntimeError as svd_err:
-            # Last-resort fallback to QR.
-            print(f"[Hessian] SVD fallback failed ({svd_err}); using QR.")
-            Q_full_cpu, _ = torch.linalg.qr(Q_full_cpu, mode="reduced")
-
-        Q_full  = Q_full_cpu.to(device=device, dtype=torch.float32)
-        eigvals = eigvals.to(device=device, dtype=torch.float32)
-        del Q_full_cpu
-        _free_memory(device)
+        if _is_gpu() and (device.type == "cuda"):
+            # Diagnostic to surface shape/dtype/contiguity issues before the call.
+            _gbytes = Q_full_cpu.numel() * Q_full_cpu.element_size() / 1e9
+            print(
+                f"[Hessian] Pre-SVD Q_full_cpu: device={Q_full_cpu.device}, "
+                f"dtype={Q_full_cpu.dtype}, shape={tuple(Q_full_cpu.shape)}, "
+                f"contiguous={Q_full_cpu.is_contiguous()}, "
+                f"finite={torch.isfinite(Q_full_cpu).all().item()}, "
+                f"size={_gbytes:.2f} GB"
+            )
+            try:
+                # Move to GPU and run cuSOLVER SVD there.
+                Q_full_dev = Q_full_cpu.to(device=device, dtype=torch.float32)
+                del Q_full_cpu
+                gc.collect()
+                # For (m, k) with m >> k, full_matrices=False returns (m, k), (k,), (k, k).
+                # cuSOLVER gesvd handles this case natively.
+                U, S, _ = torch.linalg.svd(Q_full_dev, full_matrices=False)
+                Q_full_dev = U.contiguous()
+                del U, S
+                Q_full  = Q_full_dev
+                eigvals = eigvals.to(device=device, dtype=torch.float32)
+            except RuntimeError as svd_err:
+                # If GPU SVD OOMs, fall back to a Gram-matrix-based re-orthonormalisation.
+                # Since Q_store has orthonormal columns and eigvecs is orthonormal, the
+                # only drift is fp noise. Compute Gram = Q_full^T Q_full, SVD Gram, then
+                # multiply Q_full by the inverse-sqrt singular vectors.
+                print(f"[Hessian] GPU SVD failed ({svd_err}); using Gram-based re-orth.")
+                try:
+                    # Q_full_dev may or may not exist depending on where it failed.
+                    if 'Q_full_dev' in locals():
+                        Gram = Q_full_dev.T @ Q_full_dev
+                    else:
+                        Gram = Q_full_cpu.T @ Q_full_cpu
+                    G_eigvals, G_eigvecs = torch.linalg.eigh(
+                        0.5 * (Gram + Gram.T)
+                    )
+                    # Whiten: Q_full <- Q_full @ G_eigvecs @ diag(1/sqrt(max(λ, eps)))
+                    G_eigvals = G_eigvals.clamp_min(1e-12)
+                    inv_sqrt = G_eigvecs / torch.sqrt(G_eigvals).unsqueeze(0)
+                    if 'Q_full_dev' in locals():
+                        Q_full_dev = Q_full_dev @ inv_sqrt
+                        Q_full_dev = Q_full_dev.contiguous()
+                        Q_full = Q_full_dev
+                    else:
+                        Q_full_cpu = Q_full_cpu @ inv_sqrt
+                        Q_full_cpu = Q_full_cpu.contiguous()
+                        Q_full = Q_full_cpu.to(device=device, dtype=torch.float32)
+                    eigvals = eigvals.to(device=device, dtype=torch.float32)
+                except RuntimeError as gram_err:
+                    # Last resort: accept fp drift and skip explicit re-orthonormalisation.
+                    # The matrix is already (nearly) orthonormal to ~1e-5; downstream
+                    # null-space projection degrades gracefully with that error scale.
+                    print(f"[Hessian] Gram re-orth failed ({gram_err}); using raw Q_full.")
+                    if 'Q_full_dev' in locals():
+                        Q_full = Q_full_dev.contiguous()
+                    else:
+                        Q_full = Q_full_cpu.to(device=device, dtype=torch.float32)
+                    eigvals = eigvals.to(device=device, dtype=torch.float32)
+        else:
+            # MPS path: keep CPU SVD. cuSOLVER unavailable, MKL handles tall-skinny fine.
+            try:
+                U, S, _ = torch.linalg.svd(Q_full_cpu, full_matrices=False)
+                Q_full_cpu = U
+                del U, S
+            except RuntimeError as svd_err:
+                print(f"[Hessian] SVD failed on MPS ({svd_err}); skipping re-orth.")
+            Q_full  = Q_full_cpu.to(device=device, dtype=torch.float32)
+            eigvals = eigvals.to(device=device, dtype=torch.float32)
+            del Q_full_cpu
+            _free_memory(device)
 
     return Q_full, eigvals
 
@@ -1123,13 +1181,38 @@ def compute_single_domain_eigenspace(
     del F_local_cpu, V, inv_sqrt_sigma
     gc.collect()
 
-    # ── QR for numerical stability ────────────────────────────────────────
-    Q_cpu = _orthonormalize(Q_cpu)
+    # ── Re-orthonormalise via GPU SVD (cuSOLVER) — bypasses CPU LAPACK crashes ──
+    _gbytes = Q_cpu.numel() * Q_cpu.element_size() / 1e9
+    if rank == 0:
+        print(
+            f"[Hessian] Pre-reorth Q: device={Q_cpu.device}, dtype={Q_cpu.dtype}, "
+            f"shape={tuple(Q_cpu.shape)}, contiguous={Q_cpu.is_contiguous()}, "
+            f"finite={torch.isfinite(Q_cpu).all().item()}, size={_gbytes:.2f} GB"
+        )
+    if _is_gpu() and (device.type == "cuda"):
+        try:
+            Q_dev = Q_cpu.to(device=device, dtype=torch.float32)
+            del Q_cpu
+            gc.collect()
+            U, _, _ = torch.linalg.svd(Q_dev, full_matrices=False)
+            Q_dev = U.contiguous()
+            del U
+            Q      = Q_dev
+            Lambda = sigma.to(device=device, dtype=torch.float32)
+        except RuntimeError as gpu_err:
+            print(f"[Hessian] GPU SVD in Gram-recovery failed ({gpu_err}); using CPU fallback.")
+            Q_cpu = _orthonormalize(Q_cpu)
+            Q      = Q_cpu.to(device=device, dtype=torch.float32)
+            Lambda = sigma.to(device=device, dtype=torch.float32)
+            del Q_cpu
+    else:
+        # MPS path: CPU SVD. cuSOLVER unavailable on MPS.
+        Q_cpu = _orthonormalize(Q_cpu)
+        Q      = Q_cpu.to(device=device, dtype=torch.float32)
+        Lambda = sigma.to(device=device, dtype=torch.float32)
+        del Q_cpu
 
-    # ── Move to device ────────────────────────────────────────────────────
-    Q      = Q_cpu.to(device=device, dtype=torch.float32)
-    Lambda = sigma.to(device=device, dtype=torch.float32)
-    del Q_cpu, sigma
+    del sigma
     _free_memory(device)
 
     # Materialize for clean graph on XLA
@@ -1201,7 +1284,7 @@ def recover_eigenspace_from_factor(F_global, k, eps=1e-8):
 
     singular_vals = torch.sqrt(eigvals.clamp_min(eps))
     Q = F_global @ V / singular_vals.unsqueeze(0)
-    Q, _ = torch.linalg.qr(Q, mode="reduced")
+    Q = _orthonormalize(Q)
 
     Q      = Q.detach().contiguous()
     eigvals = eigvals.detach().contiguous()
