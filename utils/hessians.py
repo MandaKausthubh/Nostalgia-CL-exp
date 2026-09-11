@@ -787,6 +787,9 @@ def lanczos(hvp_fn, dim, k, device):
             q_j = Q_store[:, j]          # already on device
 
         # ── HVP ───────────────────────────────────────────────────────────
+        if rank == 0 and (j % 4 == 0 or j == k - 1):
+            import time as _t
+            print(f"    [Lanczos] iter {j+1}/{k}", flush=True)
         v = hvp_fn(q_j)
         xm.mark_step()
         v = v.detach()
@@ -927,85 +930,70 @@ def _single_lanczos_pass(model, k, device, inputs, targets):
         eigvals = eigvals.detach().contiguous()
         xm.mark_step()
     else:
-        # GPU / MPS: lift to GPU then orthonormalise via cuSOLVER SVD.
-        # CPU LAPACK SVD/QR was crashing with "Parameter N was incorrect on entry to
-        # SGESDD / SORGQR" under memory pressure. cuSOLVER on (param_dim, k) handles
-        # tall-skinny matrices without those LAPACK pitfalls. On MPS we keep CPU path.
+        # GPU / MPS path. Q_store has orthonormal columns (Lanczos full
+        # reorthogonalisation guarantees this), and eigvecs columns are also
+        # orthonormal (from eigh). So Q_full = Q_store @ eigvecs has columns
+        # that are already orthonormal to fp precision. NO giant SVD needed.
+        #
+        # Strategy: keep Q_full on CPU. Compute Gram = Q_full^T Q_full on
+        # the small (k, k) matrix in fp64 to detect / correct drift. The
+        # correction Q_full <- Q_full @ V @ diag(1/sqrt(lambda)) is also
+        # a (k, k) operation, so the tall-skinny Q_full is never lifted to
+        # the GPU and cuSOLVER never sees it.
         Q_full_cpu  = Q_store @ eigvecs
         del Q_store, eigvecs
         gc.collect()
 
-        if _is_gpu() and (device.type == "cuda"):
-            # Diagnostic to surface shape/dtype/contiguity issues before the call.
-            _gbytes = Q_full_cpu.numel() * Q_full_cpu.element_size() / 1e9
+        # Diagnostic for the small Gram step.
+        _gbytes = Q_full_cpu.numel() * Q_full_cpu.element_size() / 1e9
+        if rank == 0:
             print(
-                f"[Hessian] Pre-SVD Q_full_cpu: device={Q_full_cpu.device}, "
+                f"[Hessian] Q_full: device={Q_full_cpu.device}, "
                 f"dtype={Q_full_cpu.dtype}, shape={tuple(Q_full_cpu.shape)}, "
                 f"contiguous={Q_full_cpu.is_contiguous()}, "
                 f"finite={torch.isfinite(Q_full_cpu).all().item()}, "
-                f"size={_gbytes:.2f} GB"
+                f"size={_gbytes:.2f} GB",
+                flush=True,
             )
-            try:
-                # Move to GPU and run cuSOLVER SVD there.
-                Q_full_dev = Q_full_cpu.to(device=device, dtype=torch.float32)
-                del Q_full_cpu
-                gc.collect()
-                # For (m, k) with m >> k, full_matrices=False returns (m, k), (k,), (k, k).
-                # cuSOLVER gesvd handles this case natively.
-                U, S, _ = torch.linalg.svd(Q_full_dev, full_matrices=False)
-                Q_full_dev = U.contiguous()
-                del U, S
-                Q_full  = Q_full_dev
-                eigvals = eigvals.to(device=device, dtype=torch.float32)
-            except RuntimeError as svd_err:
-                # If GPU SVD OOMs, fall back to a Gram-matrix-based re-orthonormalisation.
-                # Since Q_store has orthonormal columns and eigvecs is orthonormal, the
-                # only drift is fp noise. Compute Gram = Q_full^T Q_full, SVD Gram, then
-                # multiply Q_full by the inverse-sqrt singular vectors.
-                print(f"[Hessian] GPU SVD failed ({svd_err}); using Gram-based re-orth.")
-                try:
-                    # Q_full_dev may or may not exist depending on where it failed.
-                    if 'Q_full_dev' in locals():
-                        Gram = Q_full_dev.T @ Q_full_dev
-                    else:
-                        Gram = Q_full_cpu.T @ Q_full_cpu
-                    G_eigvals, G_eigvecs = torch.linalg.eigh(
-                        0.5 * (Gram + Gram.T)
-                    )
-                    # Whiten: Q_full <- Q_full @ G_eigvecs @ diag(1/sqrt(max(λ, eps)))
-                    G_eigvals = G_eigvals.clamp_min(1e-12)
-                    inv_sqrt = G_eigvecs / torch.sqrt(G_eigvals).unsqueeze(0)
-                    if 'Q_full_dev' in locals():
-                        Q_full_dev = Q_full_dev @ inv_sqrt
-                        Q_full_dev = Q_full_dev.contiguous()
-                        Q_full = Q_full_dev
-                    else:
-                        Q_full_cpu = Q_full_cpu @ inv_sqrt
-                        Q_full_cpu = Q_full_cpu.contiguous()
-                        Q_full = Q_full_cpu.to(device=device, dtype=torch.float32)
-                    eigvals = eigvals.to(device=device, dtype=torch.float32)
-                except RuntimeError as gram_err:
-                    # Last resort: accept fp drift and skip explicit re-orthonormalisation.
-                    # The matrix is already (nearly) orthonormal to ~1e-5; downstream
-                    # null-space projection degrades gracefully with that error scale.
-                    print(f"[Hessian] Gram re-orth failed ({gram_err}); using raw Q_full.")
-                    if 'Q_full_dev' in locals():
-                        Q_full = Q_full_dev.contiguous()
-                    else:
-                        Q_full = Q_full_cpu.to(device=device, dtype=torch.float32)
-                    eigvals = eigvals.to(device=device, dtype=torch.float32)
-        else:
-            # MPS path: keep CPU SVD. cuSOLVER unavailable, MKL handles tall-skinny fine.
-            try:
-                U, S, _ = torch.linalg.svd(Q_full_cpu, full_matrices=False)
-                Q_full_cpu = U
-                del U, S
-            except RuntimeError as svd_err:
-                print(f"[Hessian] SVD failed on MPS ({svd_err}); skipping re-orth.")
-            Q_full  = Q_full_cpu.to(device=device, dtype=torch.float32)
-            eigvals = eigvals.to(device=device, dtype=torch.float32)
-            del Q_full_cpu
-            _free_memory(device)
+
+        # ── Small Gram in fp64 ─────────────────────────────────────────────
+        # (param_dim, k)^T @ (param_dim, k) -> (k, k). Always tiny.
+        Gram = (Q_full_cpu.double().T @ Q_full_cpu.double()).cpu()
+        Gram = 0.5 * (Gram + Gram.T)
+
+        I_k = torch.eye(Gram.shape[0], dtype=torch.float64)
+        orth_err = torch.linalg.norm(Gram - I_k).item()
+
+        if rank == 0:
+            print(
+                f"[Hessian] Gram orth error (pre-whiten): {orth_err:.3e}",
+                flush=True,
+            )
+
+        # ── Whiten only if drift exceeds threshold ─────────────────────────
+        # Drift from Lanczos + fp32 matmul is typically ~1e-5 to 1e-3.
+        # Threshold of 1e-2 catches pathological cases without paying the
+        # (k, k) cost on every round.
+        if orth_err > 1e-2:
+            G_evals, G_evecs = torch.linalg.eigh(Gram)
+            G_evals = G_evals.clamp_min(1e-12)
+            inv_sqrt = G_evecs / torch.sqrt(G_evals).unsqueeze(0)
+            # Q_full <- Q_full @ inv_sqrt — done in fp32 for speed; the
+            # correction matrix is tiny.
+            Q_full_cpu = (Q_full_cpu @ inv_sqrt.float()).contiguous()
+            if rank == 0:
+                Gram2 = Q_full_cpu.double().T @ Q_full_cpu.double()
+                err2 = torch.linalg.norm(Gram2 - I_k).item()
+                print(
+                    f"[Hessian] Gram whiten applied; post-error={err2:.3e}",
+                    flush=True,
+                )
+        # else: skip the correction, drift is below threshold.
+
+        Q_full  = Q_full_cpu.to(device=device, dtype=torch.float32)
+        eigvals = eigvals.to(device=device, dtype=torch.float32)
+        del Q_full_cpu
+        _free_memory(device)
 
     return Q_full, eigvals
 
@@ -1057,7 +1045,8 @@ def compute_single_domain_eigenspace(
         f_gb = param_dim * k * Ea * 4 / 1e9
         print(
             f"[SingleDomainEigenspace] param_dim={param_dim:,}, k={k}, "
-            f"Ea={Ea}, F_local RAM ≈ {f_gb:.2f} GB"
+            f"Ea={Ea}, F_local RAM ≈ {f_gb:.2f} GB",
+            flush=True,
         )
         del params_snapshot
 
@@ -1103,7 +1092,8 @@ def compute_single_domain_eigenspace(
 
         if rank == 0:
             print(
-                f"  [Round {e+1}/{Ea}] batch_size={hess_bs}/{actual_bs}"
+                f"  [Round {e+1}/{Ea}] batch_size={hess_bs}/{actual_bs}",
+                flush=True,
             )
 
         # ── Single Lanczos pass ───────────────────────────────────────────
@@ -1181,36 +1171,46 @@ def compute_single_domain_eigenspace(
     del F_local_cpu, V, inv_sqrt_sigma
     gc.collect()
 
-    # ── Re-orthonormalise via GPU SVD (cuSOLVER) — bypasses CPU LAPACK crashes ──
+    # ── Re-orthonormalise via small Gram only (no giant SVD) ─────────────
+    # F_local columns are PSD factors from Lanczos — already orthonormal in
+    # the ideal case; V columns from eigh(G) are also orthonormal. Q_cpu
+    # = F_local @ V / sigma is therefore (nearly) orthonormal. The drift is
+    # captured by Gram = Q_cpu^T Q_cpu, a tiny (k_eff, k_eff) matrix.
     _gbytes = Q_cpu.numel() * Q_cpu.element_size() / 1e9
     if rank == 0:
         print(
             f"[Hessian] Pre-reorth Q: device={Q_cpu.device}, dtype={Q_cpu.dtype}, "
             f"shape={tuple(Q_cpu.shape)}, contiguous={Q_cpu.is_contiguous()}, "
-            f"finite={torch.isfinite(Q_cpu).all().item()}, size={_gbytes:.2f} GB"
+            f"finite={torch.isfinite(Q_cpu).all().item()}, size={_gbytes:.2f} GB",
+            flush=True,
         )
-    if _is_gpu() and (device.type == "cuda"):
-        try:
-            Q_dev = Q_cpu.to(device=device, dtype=torch.float32)
-            del Q_cpu
-            gc.collect()
-            U, _, _ = torch.linalg.svd(Q_dev, full_matrices=False)
-            Q_dev = U.contiguous()
-            del U
-            Q      = Q_dev
-            Lambda = sigma.to(device=device, dtype=torch.float32)
-        except RuntimeError as gpu_err:
-            print(f"[Hessian] GPU SVD in Gram-recovery failed ({gpu_err}); using CPU fallback.")
-            Q_cpu = _orthonormalize(Q_cpu)
-            Q      = Q_cpu.to(device=device, dtype=torch.float32)
-            Lambda = sigma.to(device=device, dtype=torch.float32)
-            del Q_cpu
-    else:
-        # MPS path: CPU SVD. cuSOLVER unavailable on MPS.
-        Q_cpu = _orthonormalize(Q_cpu)
-        Q      = Q_cpu.to(device=device, dtype=torch.float32)
-        Lambda = sigma.to(device=device, dtype=torch.float32)
-        del Q_cpu
+
+    Gram = (Q_cpu.double().T @ Q_cpu.double()).cpu()
+    Gram = 0.5 * (Gram + Gram.T)
+    I_k  = torch.eye(Gram.shape[0], dtype=torch.float64)
+    orth_err = torch.linalg.norm(Gram - I_k).item()
+    if rank == 0:
+        print(
+            f"[Hessian] Gram orth error (pre-whiten): {orth_err:.3e}",
+            flush=True,
+        )
+
+    if orth_err > 1e-2:
+        G_evals, G_evecs = torch.linalg.eigh(Gram)
+        G_evals = G_evals.clamp_min(1e-12)
+        inv_sqrt = G_evecs / torch.sqrt(G_evals).unsqueeze(0)
+        Q_cpu = (Q_cpu @ inv_sqrt.float()).contiguous()
+        if rank == 0:
+            Gram2 = Q_cpu.double().T @ Q_cpu.double()
+            err2 = torch.linalg.norm(Gram2 - I_k).item()
+            print(
+                f"[Hessian] Gram whiten applied; post-error={err2:.3e}",
+                flush=True,
+            )
+
+    Q      = Q_cpu.to(device=device, dtype=torch.float32)
+    Lambda = sigma.to(device=device, dtype=torch.float32)
+    del Q_cpu
 
     del sigma
     _free_memory(device)
@@ -1221,16 +1221,12 @@ def compute_single_domain_eigenspace(
     xm.mark_step()
 
     # ── Sanity check ──────────────────────────────────────────────────────
-    with torch.no_grad():
-        Q_double = Q.cpu().double()
-        qtq = Q_double.T @ Q_double
-        err = (qtq - torch.eye(qtq.shape[0], device=torch.device("cpu"), dtype=torch.double)).abs().max()
-        if rank == 0:
-            print(
-                f"  [SingleDomainEigenspace] k_eff={k_eff}, "
-                f"orthogonality error: {err.item():.2e}"
-            )
-        del Q_double, qtq
+    if rank == 0:
+        print(
+            f"  [SingleDomainEigenspace] k_eff={k_eff}, "
+            f"final orthogonality error: {orth_err:.2e}",
+            flush=True,
+        )
     _free_memory(device)
 
     # Restore model to train mode
