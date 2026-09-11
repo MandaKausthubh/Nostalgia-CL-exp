@@ -946,15 +946,14 @@ def _single_lanczos_pass(model, k, device, inputs, targets):
 
         # Diagnostic for the small Gram step.
         _gbytes = Q_full_cpu.numel() * Q_full_cpu.element_size() / 1e9
-        if rank == 0:
-            print(
-                f"[Hessian] Q_full: device={Q_full_cpu.device}, "
-                f"dtype={Q_full_cpu.dtype}, shape={tuple(Q_full_cpu.shape)}, "
-                f"contiguous={Q_full_cpu.is_contiguous()}, "
-                f"finite={torch.isfinite(Q_full_cpu).all().item()}, "
-                f"size={_gbytes:.2f} GB",
-                flush=True,
-            )
+        print(
+            f"[Hessian] Q_full: device={Q_full_cpu.device}, "
+            f"dtype={Q_full_cpu.dtype}, shape={tuple(Q_full_cpu.shape)}, "
+            f"contiguous={Q_full_cpu.is_contiguous()}, "
+            f"finite={torch.isfinite(Q_full_cpu).all().item()}, "
+            f"size={_gbytes:.2f} GB",
+            flush=True,
+        )
 
         # ── Small Gram in fp64 ─────────────────────────────────────────────
         # (param_dim, k)^T @ (param_dim, k) -> (k, k). Always tiny.
@@ -964,11 +963,10 @@ def _single_lanczos_pass(model, k, device, inputs, targets):
         I_k = torch.eye(Gram.shape[0], dtype=torch.float64)
         orth_err = torch.linalg.norm(Gram - I_k).item()
 
-        if rank == 0:
-            print(
-                f"[Hessian] Gram orth error (pre-whiten): {orth_err:.3e}",
-                flush=True,
-            )
+        print(
+            f"[Hessian] Gram orth error (pre-whiten): {orth_err:.3e}",
+            flush=True,
+        )
 
         # ── Whiten only if drift exceeds threshold ─────────────────────────
         # Drift from Lanczos + fp32 matmul is typically ~1e-5 to 1e-3.
@@ -981,13 +979,12 @@ def _single_lanczos_pass(model, k, device, inputs, targets):
             # Q_full <- Q_full @ inv_sqrt — done in fp32 for speed; the
             # correction matrix is tiny.
             Q_full_cpu = (Q_full_cpu @ inv_sqrt.float()).contiguous()
-            if rank == 0:
-                Gram2 = Q_full_cpu.double().T @ Q_full_cpu.double()
-                err2 = torch.linalg.norm(Gram2 - I_k).item()
-                print(
-                    f"[Hessian] Gram whiten applied; post-error={err2:.3e}",
-                    flush=True,
-                )
+            Gram2 = Q_full_cpu.double().T @ Q_full_cpu.double()
+            err2 = torch.linalg.norm(Gram2 - I_k).item()
+            print(
+                f"[Hessian] Gram whiten applied; post-error={err2:.3e}",
+                flush=True,
+            )
         # else: skip the correction, drift is below threshold.
 
         Q_full  = Q_full_cpu.to(device=device, dtype=torch.float32)
