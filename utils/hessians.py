@@ -595,6 +595,23 @@ def _free_memory(device=None):
         torch.mps.empty_cache()
 
 
+def _orthonormalize(M: torch.Tensor) -> torch.Tensor:
+    """
+    Numerically stable orthonormalisation of M's columns.
+
+    Prefers SVD (U, _, _) — handles rank-deficient matrices and bypasses the
+    LAPACK QR path that can fail with "Parameter N was incorrect on entry to
+    SORGQR" under memory pressure or with degenerate inputs. Falls back to QR
+    if SVD itself errors out.
+    """
+    try:
+        U, _, _ = torch.linalg.svd(M, full_matrices=False)
+        return U
+    except RuntimeError:
+        Q, _ = torch.linalg.qr(M, mode="reduced")
+        return Q
+
+
 # ---------------------------------------------------------------------------
 # Param helpers
 # ---------------------------------------------------------------------------
@@ -915,7 +932,17 @@ def _single_lanczos_pass(model, k, device, inputs, targets):
         del Q_store, eigvecs
         gc.collect()
 
-        Q_full_cpu, _ = torch.linalg.qr(Q_full_cpu, mode="reduced")
+        # Prefer SVD-based orthonormalisation over QR: avoids LAPACK's SORGQR path
+        # which can crash with "Parameter N was incorrect" under memory pressure or
+        # when the matrix is rank-deficient. SVD is numerically stable for either case.
+        try:
+            U, S, _ = torch.linalg.svd(Q_full_cpu, full_matrices=False)
+            Q_full_cpu = U
+            del U, S
+        except RuntimeError as svd_err:
+            # Last-resort fallback to QR.
+            print(f"[Hessian] SVD fallback failed ({svd_err}); using QR.")
+            Q_full_cpu, _ = torch.linalg.qr(Q_full_cpu, mode="reduced")
 
         Q_full  = Q_full_cpu.to(device=device, dtype=torch.float32)
         eigvals = eigvals.to(device=device, dtype=torch.float32)
@@ -1097,7 +1124,7 @@ def compute_single_domain_eigenspace(
     gc.collect()
 
     # ── QR for numerical stability ────────────────────────────────────────
-    Q_cpu, _ = torch.linalg.qr(Q_cpu, mode="reduced")
+    Q_cpu = _orthonormalize(Q_cpu)
 
     # ── Move to device ────────────────────────────────────────────────────
     Q      = Q_cpu.to(device=device, dtype=torch.float32)

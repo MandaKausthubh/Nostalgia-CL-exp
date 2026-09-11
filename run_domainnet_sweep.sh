@@ -190,7 +190,18 @@ for method in "${METHODS[@]}"; do
             extra_args="--base_optimizer adamw --lr $lr --head_lr $head_lr --weight_decay $weight_decay --grad_clip_val $grad_clip --seed $seed"
             if [ "$method" = "nostalgia" ] || [ "$method" = "gpm" ] || [ "$method" = "ewc_nostalgia" ]; then
                 # GPU-safe null-space / GPM subspace estimation.
-                extra_args="${extra_args} --k 64 --nostalgia_accumulation_rounds 5 --nostalgia_max_hessian_batch 32 --nostalgia_num_samples 2000"
+                # Per-backbone Hessian cap + accumulation rounds: ViT/SigLIP lift
+                # (param_dim × k) tensors to CPU for QR/eigh, so we cap double-backward
+                # batch size and reduce Ea to keep memory + SORGQR under control.
+                if [ "$backbone" = "resnet18" ]; then
+                    hess_bs=32
+                    hess_rounds=5
+                else
+                    # vit / siglip
+                    hess_bs=16
+                    hess_rounds=3
+                fi
+                extra_args="${extra_args} --k 64 --nostalgia_accumulation_rounds ${hess_rounds} --nostalgia_max_hessian_batch ${hess_bs} --nostalgia_num_samples 2000"
             fi
             if [ "$method" = "ewc" ] || [ "$method" = "ewc_nostalgia" ]; then
                 extra_args="${extra_args} --ewc_lambda 400.0"

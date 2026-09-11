@@ -52,6 +52,9 @@ def _safe_qr(X: torch.Tensor) -> torch.Tensor:
 
         X_cpu = X.detach().to("cpu", dtype=torch.float32)
         Q_cpu, _ = torch.linalg.qr(X_cpu, mode="reduced")
+        # Note: keep this QR call for now — X_cpu here is small (Gram-eigvec
+        # basis) and the SVD path would be wasteful. The SVD-based fallback
+        # in utils/hessians.py:_orthonormalize handles the larger matrices.
         result = Q_cpu.to(device=original_device, dtype=original_dtype)
 
         # Compile the CPU→device transfer immediately so it doesn't
