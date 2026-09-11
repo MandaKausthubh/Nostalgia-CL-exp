@@ -15,8 +15,8 @@ set -euo pipefail
 
 # ----- Hardware / runtime ----------------------------------------------
 ACCEL="${ACCEL:-gpu}"
-DEVICES="${DEVICES:-4}"
-STRATEGY="${STRATEGY:-ddp_find_unused_parameters_true}"
+DEVICES="${DEVICES:-1}"
+STRATEGY="${STRATEGY:-auto}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PRECISION="${PRECISION:-bf16-mixed}"
 
@@ -121,17 +121,17 @@ declare -A IMG_SIZE=(
     ["siglip"]="${IMG_SIZE_SIGLIP:-224}"
 )
 
-# Per-GPU batch size on 4× A100 80GB. Effective = BS × ACCUM × DEVICES.
+# Per-GPU batch size on single A100 80GB. Effective = BS × ACCUM × DEVICES.
 declare -A BS_DEFAULT=(
-    ["resnet18"]="${BS_RESNET:-384}"
-    ["vit"]="${BS_VIT:-96}"
-    ["siglip"]="${BS_SIGLIP:-64}"
+    ["resnet18"]="${BS_RESNET:-768}"
+    ["vit"]="${BS_VIT:-192}"
+    ["siglip"]="${BS_SIGLIP:-128}"
 )
 
 declare -A ACCUM_DEFAULT=(
     ["resnet18"]="${ACCUM_RESNET:-1}"
-    ["vit"]="${ACCUM_VIT:-2}"
-    ["siglip"]="${ACCUM_SIGLIP:-2}"
+    ["vit"]="${ACCUM_VIT:-1}"
+    ["siglip"]="${ACCUM_SIGLIP:-1}"
 )
 
 # ----- Optional axis overrides ------------------------------------------

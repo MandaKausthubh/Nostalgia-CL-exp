@@ -151,6 +151,7 @@ class BaseImageDataModule(pl.LightningDataModule):
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
             persistent_workers=bool(self.hparams.num_workers > 0),
+            prefetch_factor=4 if self.hparams.num_workers > 0 else 2,
             drop_last=shuffle,
         )
 

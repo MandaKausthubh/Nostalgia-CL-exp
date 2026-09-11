@@ -179,6 +179,15 @@ def build_tasks(args, data_modules, default_device):
             hessian_num_samples = min(hessian_num_samples, len(hessian_dataset))
             hessian_dataset = Subset(hessian_dataset, range(hessian_num_samples))
 
+        # Resolve I/O parallelism once: pin_memory + num_workers only matter on CUDA.
+        # For CPU (MPS) and TPU we keep num_workers=0 because worker processes can't
+        # access the accelerator memory mapping and would actually slow things down.
+        on_cuda = (default_device.type == "cuda")
+        nw = getattr(args, "num_workers", 0) if on_cuda else 0
+        pin = on_cuda
+        prefetch = 4 if nw > 0 else 2
+        persistent = bool(nw > 0)
+
         tasks.append({
             "name": task_name,
             "train_ds": dm.train_ds,
@@ -187,13 +196,19 @@ def build_tasks(args, data_modules, default_device):
                 train_dataset,
                 batch_size=cfg["batch_size"],
                 shuffle=True,
-                pin_memory=(default_device.type == "cuda"),
+                num_workers=nw,
+                pin_memory=pin,
+                persistent_workers=persistent,
+                prefetch_factor=prefetch,
             ),
             "hessian_loader": DataLoader(
                 hessian_dataset,
                 batch_size=cfg["batch_size"],
                 shuffle=True,
-                pin_memory=(default_device.type == "cuda"),
+                num_workers=nw,
+                pin_memory=pin,
+                persistent_workers=persistent,
+                prefetch_factor=prefetch,
             ),
         })
     return tasks

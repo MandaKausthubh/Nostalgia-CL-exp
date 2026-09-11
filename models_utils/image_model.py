@@ -431,6 +431,18 @@ class ImageModelModule(pl.LightningModule):
         self._val_accs_per_task = {}
         self._val_preds = {}
 
+    def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
+        # Lightning default does `.to(device)` WITHOUT non_blocking, which serialises
+        # H2D copies on the compute stream. With pin_memory=True on the loader this
+        # kills throughput. Override to issue true async copies.
+        out = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                out[k] = v.to(device, non_blocking=True)
+            else:
+                out[k] = v
+        return out
+
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         if self.logging_disabled:
             return

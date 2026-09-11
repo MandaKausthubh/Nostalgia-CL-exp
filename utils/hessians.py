@@ -649,9 +649,22 @@ def hvp_flat(vec, params, model, inputs, targets, loss_fn):
         inputs_detached = inputs.detach()
 
     inputs_proc = model.preprocess_inputs(inputs_detached)
-    representations = functional_call(model.backbone, fresh_params, (inputs_proc,))
-    outputs = model.task_head_list[model.active_task](representations)
-    loss = loss_fn(outputs, targets.detach())
+    # Force attention to use the math kernel during the Hessian forward pass.
+    # The flash / memory-efficient / cuDNN-attention backends do not register a
+    # second-order autograd backward, so torch.autograd.grad(create_graph=True)
+    # fails with "derivative for aten::_scaled_dot_product_efficient_attention_backward
+    # is not implemented" on ViT/SigLIP. The math kernel is differentiable end-to-end.
+    if _is_gpu():
+        with torch.backends.cuda.sdp_kernel(
+            enable_math=True, enable_flash=False, enable_mem_efficient=False, enable_cudnn=False
+        ):
+            representations = functional_call(model.backbone, fresh_params, (inputs_proc,))
+            outputs = model.task_head_list[model.active_task](representations)
+            loss = loss_fn(outputs, targets.detach())
+    else:
+        representations = functional_call(model.backbone, fresh_params, (inputs_proc,))
+        outputs = model.task_head_list[model.active_task](representations)
+        loss = loss_fn(outputs, targets.detach())
 
     # ── First backward (keep graph) ───────────────────────────────────────
     grads = torch.autograd.grad(
@@ -990,15 +1003,18 @@ def compute_single_domain_eigenspace(
         # Cap batch size for OOM safety during double-backward
         actual_bs = input_ids.shape[0]
         hess_bs = min(actual_bs, max_hessian_batch)
+        # non_blocking=True is only safe with pin_memory=True, which the
+        # Hessian DataLoader now sets on CUDA. Skips host→device sync.
+        non_blocking = (input_ids.device.type == "cpu") and (device.type == "cuda")
 
         if attention_mask is not None:
             inputs = {
-                "input_ids":      input_ids[:hess_bs].to(device),
-                "attention_mask": attention_mask[:hess_bs].to(device),
+                "input_ids":      input_ids[:hess_bs].to(device, non_blocking=non_blocking),
+                "attention_mask": attention_mask[:hess_bs].to(device, non_blocking=non_blocking),
             }
         else:
-            inputs = input_ids[:hess_bs].to(device)
-        targets_dev = targets[:hess_bs].to(device)
+            inputs = input_ids[:hess_bs].to(device, non_blocking=non_blocking)
+        targets_dev = targets[:hess_bs].to(device, non_blocking=non_blocking)
 
         if rank == 0:
             print(
