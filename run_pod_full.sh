@@ -88,12 +88,12 @@ echo "LoRA          = $USE_LORA (r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPO
 [ -d "$REPO_DIR" ] || { echo "[FATAL] repo not found at $REPO_DIR"; exit 1; }
 [ -d "$DATA_ROOT_DN" ] || { echo "[FATAL] dataset not found at $DATA_ROOT_DN"; exit 1; }
 for d in clipart infograph painting quickdraw real sketch; do
-    if [ ! -d "$DATA_ROOT_DN/$d/train" ]; then
-        echo "[FATAL] missing $DATA_ROOT_DN/$d/train"
+    if [ ! -d "$DATA_ROOT_DN/$d" ] || [ ! -f "$DATA_ROOT_DN/${d}_train.txt" ]; then
+        echo "[FATAL] missing $DATA_ROOT_DN/$d (or ${d}_train.txt)"
         exit 1
     fi
 done
-echo "[ok] all 6 domain folders present"
+echo "[ok] all 6 domain folders + split lists present"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "[warn] nvidia-smi missing; GPU may be unavailable"
