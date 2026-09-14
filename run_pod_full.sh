@@ -12,8 +12,8 @@
 set -euo pipefail
 
 # ---------- Config ----------
-export DATA_ROOT_DN="${DATA_ROOT_DN:-/workspace/data/domainnet}"
-export WANDB_DIR="${WANDB_DIR:-/workspace/data/wandb}"
+export DATA_ROOT_DN="${DATA_ROOT_DN:-$HOME/domainnet}"
+export WANDB_DIR="${WANDB_DIR:-$HOME/wandb_log}"
 REPO_DIR="${REPO_DIR:-/workspace/Nostalgia-CL-exp}"
 
 # RunPod pod: 1 GPU by default. Override if multi-GPU pod.

@@ -317,7 +317,9 @@ def run_sequential_pipeline(args):
         string_process_func=lambda x: "Arguments for this training are:\n" + str(x)
     )
 
-    wandb_dir = os.environ.get("WANDB_DIR", "/kaggle/tmp/wandb")
+    wandb_dir = os.path.expanduser(
+        os.environ.get("WANDB_DIR", "~/wandb_log")
+    )
     os.makedirs(wandb_dir, exist_ok=True)
     wandb_logger = NostalgiaWandbLogger(
         project=args.wandb_project,

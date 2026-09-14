@@ -12,7 +12,7 @@ set -euo pipefail
 # Defaults give a 7 × 3 × 3 = 63-run main table. Override any axis via env:
 #   SEEDS="0 1" BACKBONES="resnet18 vit" METHODS="nostalgia naive_adam" \
 #       bash run_domainnet_sweep.sh
-#   DATA_ROOT_DN=/workspace/data/domainnet bash run_domainnet_sweep.sh
+#   DATA_ROOT_DN=$HOME/domainnet bash run_domainnet_sweep.sh
 #   BS_SIGLIP=32 PH2=10 bash run_domainnet_sweep.sh   # per-backbone / per-budget knobs
 #   USE_LORA=0 K=32 bash run_domainnet_sweep.sh       # full-ft fallback / larger null-space
 #
@@ -102,7 +102,7 @@ declare -A VAL_EPOCHS_MAP=(
 )
 
 # ----- Data -------------------------------------------------------------
-DATA_ROOT_DN="${DATA_ROOT_DN:-/workspace/data/domainnet}"
+DATA_ROOT_DN="${DATA_ROOT_DN:-$HOME/domainnet}"
 
 TASKS=(
     "domainnet_clipart"
