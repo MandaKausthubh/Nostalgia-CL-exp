@@ -25,6 +25,18 @@ export PRECISION="${PRECISION:-bf16-mixed}"
 BACKBONE="${BACKBONE:-resnet18}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
 
+# LoRA (default: ON, same defaults as run_domainnet_sweep.sh).
+# USE_LORA=0 falls back to full finetuning.
+USE_LORA="${USE_LORA:-1}"
+LORA_R="${LORA_R:-16}"
+LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+if [ "$USE_LORA" = "1" ]; then
+    LORA_ARGS="--use_lora --lora_r $LORA_R --lora_alpha $LORA_ALPHA --lora_dropout $LORA_DROPOUT"
+else
+    LORA_ARGS=""
+fi
+
 # Methods (override via METHODS=...).
 METHODS="${METHODS:-nostalgia naive_adam ewc gpm agem sdft}"
 
@@ -71,6 +83,7 @@ echo "METHODS       = $METHODS"
 echo "TASKS         = $TASKS"
 echo "MODE          = $MODE"
 echo "ACCEL/DEVICES = $ACCEL / $DEVICES"
+echo "LoRA          = $USE_LORA (r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT)"
 
 [ -d "$REPO_DIR" ] || { echo "[FATAL] repo not found at $REPO_DIR"; exit 1; }
 [ -d "$DATA_ROOT_DN" ] || { echo "[FATAL] dataset not found at $DATA_ROOT_DN"; exit 1; }
@@ -126,7 +139,8 @@ else
         --base_optimizer adamw --lr 1e-3 --head_lr 5e-4 \
         --weight_decay 1e-4 --grad_clip_val 1.0 \
         --k 16 --nostalgia_accumulation_rounds 1 \
-        --nostalgia_max_hessian_batch 8 --nostalgia_num_samples 100
+        --nostalgia_max_hessian_batch 8 --nostalgia_num_samples 100 \
+        $LORA_ARGS
     echo "[ok] smoke passed"
 fi
 
@@ -188,6 +202,7 @@ for method in $METHODS; do
         --val_check_interval 1.0 \
         --wandb_project "domainnet-cl" \
         --wandb_name "$exp_name" \
+        $LORA_ARGS \
         $extra_args
 
     echo "[done] $exp_name"

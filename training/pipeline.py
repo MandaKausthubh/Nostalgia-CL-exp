@@ -185,7 +185,7 @@ def build_tasks(args, data_modules, default_device):
         on_cuda = (default_device.type == "cuda")
         nw = getattr(args, "num_workers", 0) if on_cuda else 0
         pin = on_cuda
-        prefetch = 4 if nw > 0 else 2
+        prefetch = 4 if nw > 0 else None  # prefetch_factor requires num_workers > 0
         persistent = bool(nw > 0)
 
         tasks.append({
@@ -262,6 +262,10 @@ def _phase1_cache_path(args, tasks, dataset_config):
         "backbone": getattr(args, "backbone", None),
         "pretrained": getattr(args, "pretrained", True),
         "image_size": getattr(args, "image_size", None),
+        "use_lora": getattr(args, "use_lora", False),
+        "lora_r": getattr(args, "lora_r", None),
+        "lora_alpha": getattr(args, "lora_alpha", None),
+        "lora_dropout": getattr(args, "lora_dropout", None),
         "tasks": sorted(t["name"] for t in tasks),
         "epochs_phase1": args.epochs_phase1,
         "head_lr": args.head_lr,
@@ -304,8 +308,8 @@ def run_sequential_pipeline(args):
     _is_image = _active_tasks and _active_tasks[0] not in TEXT_TASK_REGISTRY
     display_args = vars(args).copy()
     if _is_image:
-        for k in ["model_name", "use_lora", "lora_r", "lora_alpha", "lora_dropout",
-                  "quantization", "pooling", "head_layers", "max_length"]:
+        # LoRA keys stay: they now configure the image pipeline too.
+        for k in ["model_name", "quantization", "pooling", "head_layers", "max_length"]:
             display_args.pop(k, None)
 
     print_global(
@@ -389,6 +393,10 @@ def run_sequential_pipeline(args):
             pretrained=getattr(args, "pretrained", True),
             sdft_lambda_distillation=getattr(args, "sdft_lambda_distillation", 1.0),
             sdft_temperature=getattr(args, "sdft_temperature", 2.0),
+            use_lora=getattr(args, "use_lora", False),
+            lora_r=getattr(args, "lora_r", 8),
+            lora_alpha=getattr(args, "lora_alpha", 16),
+            lora_dropout=getattr(args, "lora_dropout", 0.05),
         )
     else:
         # Language model pipeline

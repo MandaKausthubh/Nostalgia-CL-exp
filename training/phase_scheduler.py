@@ -556,6 +556,10 @@ class PhaseSchedulerCallback(pl.Callback):
             "backbone": getattr(self.args, "backbone", None),
             "pretrained": getattr(self.args, "pretrained", True),
             "image_size": getattr(self.args, "image_size", None),
+            "use_lora": getattr(self.args, "use_lora", False),
+            "lora_r": getattr(self.args, "lora_r", None),
+            "lora_alpha": getattr(self.args, "lora_alpha", None),
+            "lora_dropout": getattr(self.args, "lora_dropout", None),
             "tasks": sorted(t["name"] for t in self.tasks),
             "epochs_phase1": getattr(self.args, "epochs_phase1", None),
         }

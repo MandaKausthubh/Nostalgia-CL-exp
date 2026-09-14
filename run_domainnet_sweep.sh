@@ -5,11 +5,16 @@ set -euo pipefail
 # All CL methods × all image backbones × N seeds, each over the 6 sequential
 # DomainNet domains. Target hardware: 4× A100 80GB on RunPod.
 #
+# LoRA is ON by default (USE_LORA=0 for full-ft fallback): adapter-only
+# training keeps the Nostalgia Q matrix in ~0.6M-param space (~60 MB/task)
+# instead of 85.8M-param space (5.5 GB/task, cuSOLVER int32 overflow).
+#
 # Defaults give a 7 × 3 × 3 = 63-run main table. Override any axis via env:
 #   SEEDS="0 1" BACKBONES="resnet18 vit" METHODS="nostalgia naive_adam" \
 #       bash run_domainnet_sweep.sh
 #   DATA_ROOT_DN=/workspace/data/domainnet bash run_domainnet_sweep.sh
 #   BS_SIGLIP=32 PH2=10 bash run_domainnet_sweep.sh   # per-backbone / per-budget knobs
+#   USE_LORA=0 K=32 bash run_domainnet_sweep.sh       # full-ft fallback / larger null-space
 #
 # Loop order (per spec): methods → backbones → seeds; tasks fixed per run.
 
@@ -33,6 +38,19 @@ LOG_EVERY="${LOG_EVERY:-5}"
 VAL_EVERY="${VAL_EVERY:-1.0}"     # validate once per epoch
 VAL_EPOCHS="${VAL_EPOCHS:-3}"     # validate every N Phase-2 epochs (--val_every_n_epochs)
 WANDB_PROJECT="${WANDB_PROJECT:-domainnet-cl-iclr}"
+
+# ----- LoRA (default: ON) ------------------------------------------------
+USE_LORA="${USE_LORA:-1}"         # 1 = LoRA adapters, 0 = full-ft fallback
+LORA_R="${LORA_R:-16}"
+LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+
+# ----- Nostalgia Hessian rank --------------------------------------------
+# k=24 kept identical to the full-ft setup for method comparability; over the
+# ~0.6M-dim adapter space it spans a much larger spectral fraction. Q storage
+# drops from 5.5 GB/task to ~60 MB/task. Raise uniformly via K=... if smoke
+# shows weak protection.
+K="${K:-24}"
 
 # ----- Per-backbone hyperparameters -------------------------------------
 # Backbone-specific overrides keyed by backbone name. Nested fallback:
@@ -162,6 +180,12 @@ echo "  Backbones:  ${BACKBONES[*]}  (${#BACKBONES[@]})"
 echo "  Seeds:      $SEEDS  ($_n_seeds)"
 echo "  Tasks:      ${TASKS[*]}"
 echo "  Devices:    $DEVICES × $ACCEL"
+if [ "$USE_LORA" = "1" ]; then
+    echo "  LoRA:       ON  (r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT)"
+else
+    echo "  LoRA:       OFF (full finetuning)"
+fi
+echo "  K:          $K"
 echo "  Total runs: $_total_runs  (each = 6 sequential domains)"
 echo "====================================================================="
 
@@ -184,24 +208,31 @@ for method in "${METHODS[@]}"; do
 
         for seed in $SEEDS; do
             _run_idx=$((_run_idx + 1))
-            exp_name="domainnet_${backbone}_${method}_seed${seed}_fullft"
+            if [ "$USE_LORA" = "1" ]; then
+                exp_name="domainnet_${backbone}_${method}_seed${seed}_lora"
+                lora_args="--use_lora --lora_r $LORA_R --lora_alpha $LORA_ALPHA --lora_dropout $LORA_DROPOUT"
+            else
+                exp_name="domainnet_${backbone}_${method}_seed${seed}_fullft"
+                lora_args=""
+            fi
 
             # Per-method extras.
             extra_args="--base_optimizer adamw --lr $lr --head_lr $head_lr --weight_decay $weight_decay --grad_clip_val $grad_clip --seed $seed"
             if [ "$method" = "nostalgia" ] || [ "$method" = "gpm" ] || [ "$method" = "ewc_nostalgia" ]; then
-                # GPU-safe null-space / GPM subspace estimation.
-                # Per-backbone Hessian cap + accumulation rounds: ViT/SigLIP lift
-                # (param_dim × k) tensors to CPU for QR/eigh, so we cap double-backward
-                # batch size and reduce Ea to keep memory + SORGQR under control.
+                # Hessian cuts for ICLR sweep speed. With LoRA (default) the
+                # eigenspace lives in ~0.3-0.6M-param adapter space:
+                # - resnet18 adapters: single Lanczos round, k=$K, bs=32.
+                # - vit/siglip adapters: single round, k=$K, bs=16.
+                # k=24 matches the full-ft setup (method comparability); Q
+                # storage ~60 MB/task. Raise K uniformly if smoke shows weak
+                # protection.
                 if [ "$backbone" = "resnet18" ]; then
                     hess_bs=32
-                    hess_rounds=5
                 else
                     # vit / siglip
                     hess_bs=16
-                    hess_rounds=3
                 fi
-                extra_args="${extra_args} --k 64 --nostalgia_accumulation_rounds ${hess_rounds} --nostalgia_max_hessian_batch ${hess_bs} --nostalgia_num_samples 2000"
+                extra_args="${extra_args} --k $K --nostalgia_accumulation_rounds 1 --nostalgia_max_hessian_batch ${hess_bs} --nostalgia_num_samples 1000"
             fi
             if [ "$method" = "ewc" ] || [ "$method" = "ewc_nostalgia" ]; then
                 extra_args="${extra_args} --ewc_lambda 400.0"
@@ -224,6 +255,7 @@ for method in "${METHODS[@]}"; do
             echo "  ph1/ph2     = $ph1 / $ph2"
             echo "  wd/clip     = $weight_decay / $grad_clip"
             echo "  val_every   = $val_epochs epochs  (val_check_interval=$VAL_EVERY)"
+            echo "  lora        = $USE_LORA (r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT)"
             echo "  tasks       = ${TASKS[*]}"
             echo "---------------------------------------------------------------------"
 
@@ -252,6 +284,7 @@ for method in "${METHODS[@]}"; do
                 --val_every_n_epochs "$val_epochs" \
                 --wandb_project "$WANDB_PROJECT" \
                 --wandb_name "$exp_name" \
+                $lora_args \
                 $extra_args
 
             echo "Finished: $exp_name"
