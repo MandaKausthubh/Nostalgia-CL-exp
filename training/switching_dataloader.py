@@ -14,11 +14,6 @@ class DynamicTaskDataLoader(DataLoader):
     def __init__(self, datamodule, **kwargs):
         self.datamodule = datamodule
         # Initialize super class with the first task's dataset to satisfy structural checks
-        if not getattr(datamodule, "task_loaders", None):
-            raise RuntimeError(
-                "SequentialTaskDataModule.task_loaders is empty — "
-                "check args.tasks and TASK_REGISTRY membership."
-            )
         first_loader = list(datamodule.task_loaders.values())[0]
         super().__init__(first_loader.dataset)
 
@@ -29,27 +24,14 @@ class DynamicTaskDataLoader(DataLoader):
         if task_name is None:
             # Fallback based on current_epoch if not set yet
             trainer = getattr(self.datamodule, "trainer", None)
-            schedule = getattr(self.datamodule, "schedule", [])
-            # Defensive: if schedule is empty (misconfiguration upstream),
-            # fall back to the first registered task loader rather than
-            # crashing with IndexError. Caller will surface the real bug.
-            if not schedule:
-                task_loaders = getattr(self.datamodule, "task_loaders", {})
-                if task_loaders:
-                    task_name = next(iter(task_loaders))
-                else:
-                    raise RuntimeError(
-                        "SequentialTaskDataModule.schedule and task_loaders are "
-                        "both empty — check args.tasks / args.epochs_phase1+2."
-                    )
-            elif trainer is None:
-                task_name = schedule[0][0]
+            if trainer is None:
+                task_name = self.datamodule.schedule[0][0]
             else:
                 epoch = trainer.current_epoch
-                if epoch < len(schedule):
-                    task_name = schedule[epoch][0]
+                if epoch < len(self.datamodule.schedule):
+                    task_name = self.datamodule.schedule[epoch][0]
                 else:
-                    task_name = schedule[-1][0]
+                    task_name = self.datamodule.schedule[-1][0]
         return self.datamodule.task_loaders[task_name]
 
     def __iter__(self):
@@ -88,15 +70,6 @@ class SequentialTaskDataModule(pl.LightningDataModule):
         self.val_dataloaders_list = val_dataloaders
         self.val_task_names = val_task_names
         self.active_task_name = None
-        # Surface misconfiguration early instead of crashing later in train_dataloader.
-        if not schedule:
-            print(
-                f"[SequentialTaskDataModule] WARNING: schedule is empty "
-                f"(len(schedule)=0, len(tasks)={len(tasks)}). "
-                f"args.epochs_phase1+epochs_phase2 must produce a non-empty "
-                f"epoch schedule.",
-                flush=True,
-            )
 
         if task_batch_sizes is None:
             task_batch_sizes = {}
