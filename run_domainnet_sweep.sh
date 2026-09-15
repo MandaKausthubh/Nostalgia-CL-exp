@@ -16,7 +16,7 @@ set -euo pipefail
 #   BS_SIGLIP=32 PH2=10 bash run_domainnet_sweep.sh   # per-backbone / per-budget knobs
 #   USE_LORA=0 K=32 bash run_domainnet_sweep.sh       # full-ft fallback / larger null-space
 #
-# Loop order (per spec): methods → backbones → seeds; tasks fixed per run.
+# Loop order: seeds → backbones → methods; tasks fixed per run.
 
 # ----- Hardware / runtime ----------------------------------------------
 ACCEL="${ACCEL:-gpu}"
@@ -190,8 +190,10 @@ echo "  Total runs: $_total_runs  (each = 6 sequential domains)"
 echo "====================================================================="
 
 # ----- Sweep ------------------------------------------------------------
+# Loop order: seed → backbone → method. Seed 0 completes ALL backbone×method
+# combos first, so the paper's main table can be drafted while seeds 1..N run.
 _run_idx=0
-for method in "${METHODS[@]}"; do
+for seed in $SEEDS; do
     for backbone in "${BACKBONES[@]}"; do
         image_size="${IMG_SIZE[$backbone]}"
         bs="${BS_DEFAULT[$backbone]}"
@@ -206,7 +208,7 @@ for method in "${METHODS[@]}"; do
         ph2="${PH2_MAP[$backbone]}"
         val_epochs="${VAL_EPOCHS_MAP[$backbone]}"
 
-        for seed in $SEEDS; do
+        for method in "${METHODS[@]}"; do
             _run_idx=$((_run_idx + 1))
             if [ "$USE_LORA" = "1" ]; then
                 exp_name="domainnet_${backbone}_${method}_seed${seed}_lora"
