@@ -300,6 +300,7 @@ class ImageModelModule(pl.LightningModule):
         lora_r: int = 8,
         lora_alpha: int = 16,
         lora_dropout: float = 0.05,
+        channels_last: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -317,6 +318,18 @@ class ImageModelModule(pl.LightningModule):
             self.backbone = _apply_lora_to_backbone(
                 self.backbone, backbone_name, lora_r, lora_alpha, lora_dropout,
             )
+
+        # channels_last only helps conv backbones on CUDA; ViT/SigLIP patch-embed
+        # + eager attention gain nothing, and MPS/CPU do not support the format.
+        self.channels_last = bool(
+            channels_last
+            and backbone_name.lower() in ("resnet10", "resnet18")
+            and torch.cuda.is_available()
+        )
+        if self.channels_last:
+            self.backbone = self.backbone.to(memory_format=torch.channels_last)
+            print(f"[channels_last] backbone={backbone_name} converted to "
+                  f"channels_last memory format", flush=True)
 
         if tasks_config is not None:
             self.task_head_list = torch.nn.ModuleDict({
@@ -376,16 +389,22 @@ class ImageModelModule(pl.LightningModule):
 
     def preprocess_inputs(self, inputs):
         if isinstance(inputs, torch.Tensor):
-            return {"input_ids": inputs}
+            return {"input_ids": self._to_channels_last(inputs)}
         if isinstance(inputs, dict):
             return {
-                "input_ids": inputs["input_ids"],
+                "input_ids": self._to_channels_last(inputs["input_ids"]),
                 "attention_mask": inputs.get("attention_mask", None),
             }
         return inputs
 
+    def _to_channels_last(self, x):
+        if self.channels_last and torch.is_tensor(x) and x.dim() == 4:
+            return x.contiguous(memory_format=torch.channels_last)
+        return x
+
     def forward(self, input_ids, attention_mask=None, labels=None, task_name=None, **kwargs):
         t_name = task_name if task_name is not None else self.active_task
+        input_ids = self._to_channels_last(input_ids)
         inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
         representations = self.backbone(inputs)
         return self.task_head_list[t_name](representations)

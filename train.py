@@ -44,6 +44,10 @@ def parse_args():
     model_group.add_argument("--lora_r", type=int, default=8)
     model_group.add_argument("--lora_alpha", type=int, default=16)
     model_group.add_argument("--lora_dropout", type=float, default=0.05)
+    model_group.add_argument("--channels_last", action="store_true",
+                             help="Use channels_last memory format for conv backbones "
+                                  "(resnet10/18 only; ignored for vit/siglip). Speeds up "
+                                  "conv kernels on Ampere+ GPUs.")
     model_group.add_argument(
         "--quantization",
         type=str,

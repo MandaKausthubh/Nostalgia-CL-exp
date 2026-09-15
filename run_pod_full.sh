@@ -60,6 +60,13 @@ else
     fi
 fi
 
+# Validation cost: validate every N Phase-2 epochs (still always on task-end).
+VAL_EPOCHS="${VAL_EPOCHS:-3}"
+# Optional cap on val samples per task (unset = full val set; changes reported acc).
+MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-}"
+VAL_EXTRA_ARGS="--val_every_n_epochs $VAL_EPOCHS"
+[ -n "$MAX_VAL_SAMPLES" ] && VAL_EXTRA_ARGS="$VAL_EXTRA_ARGS --max_val_samples $MAX_VAL_SAMPLES"
+
 # Per-backbone LR default (env override wins).
 case "$BACKBONE" in
     vit|siglip)  _lr_default="3e-4" ;;
@@ -134,6 +141,7 @@ else
         --precision "$PRECISION" \
         --log_every_n_steps 5 \
         --val_check_interval 1.0 \
+        $VAL_EXTRA_ARGS \
         --wandb_project "domainnet-cl-smoke" \
         --wandb_name "smoke_${BACKBONE}_${SMOKE_METHOD}" \
         --base_optimizer adamw --lr 1e-3 --head_lr 5e-4 \
@@ -200,6 +208,7 @@ for method in $METHODS; do
         --precision "$PRECISION" \
         --log_every_n_steps "$LOG_EVERY" \
         --val_check_interval 1.0 \
+        $VAL_EXTRA_ARGS \
         --wandb_project "domainnet-cl" \
         --wandb_name "$exp_name" \
         $LORA_ARGS \

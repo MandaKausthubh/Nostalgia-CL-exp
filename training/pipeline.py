@@ -207,14 +207,17 @@ def build_tasks(args, data_modules, default_device):
                 shuffle=True,
                 num_workers=nw,
                 pin_memory=pin,
-                persistent_workers=persistent,
+                # Not persistent: iterated only at task end (~N-1 times total).
+                # Keeping its pool alive would hoard idle workers next to the
+                # long-lived train/val pools.
+                persistent_workers=False,
                 prefetch_factor=prefetch,
             ),
         })
     return tasks
 
 
-def build_val_dataloaders(tasks, data_modules, default_device, dataset_config):
+def build_val_dataloaders(tasks, data_modules, default_device, dataset_config, args):
     """Build validation DataLoaders for all tasks using per-task batch sizes.
 
     Returns:
@@ -223,6 +226,13 @@ def build_val_dataloaders(tasks, data_modules, default_device, dataset_config):
     """
     val_dataloaders = []
     val_task_names = []
+
+    # Same I/O parallelism policy as build_tasks: workers + pinning only on CUDA.
+    on_cuda = (default_device.type == "cuda")
+    nw = getattr(args, "num_workers", 0) if on_cuda else 0
+    pin = on_cuda
+    prefetch = 4 if nw > 0 else None
+    persistent = bool(nw > 0)
 
     for task in tasks:
         t_name = task["name"]
@@ -235,7 +245,10 @@ def build_val_dataloaders(tasks, data_modules, default_device, dataset_config):
             TaskClassificationDataset(dm.val_ds, num_classes=task["num_classes"]),
             batch_size=cfg["batch_size"],
             shuffle=False,
-            pin_memory=(default_device.type != "mps"),
+            num_workers=nw,
+            pin_memory=pin,
+            persistent_workers=persistent,
+            prefetch_factor=prefetch,
         ))
         val_task_names.append(t_name)
 
@@ -360,7 +373,7 @@ def run_sequential_pipeline(args):
 
     tasks = build_tasks(args, data_modules, default_device)
     val_dataloaders, val_task_names = build_val_dataloaders(
-        tasks, data_modules, default_device, args.dataset_config,
+        tasks, data_modules, default_device, args.dataset_config, args,
     )
     print_global("Datasets setup completed successfully.", rank=local_rank)
 
@@ -399,6 +412,7 @@ def run_sequential_pipeline(args):
             lora_r=getattr(args, "lora_r", 8),
             lora_alpha=getattr(args, "lora_alpha", 16),
             lora_dropout=getattr(args, "lora_dropout", 0.05),
+            channels_last=getattr(args, "channels_last", False),
         )
     else:
         # Language model pipeline
@@ -500,7 +514,8 @@ def run_sequential_pipeline(args):
         devices=args.devices,
         strategy=args.strategy,
         precision=args.precision,
-        deterministic=True,
+        deterministic=False,               # deterministic=True disables cudnn.benchmark autotuning
+        benchmark=True,                    # fixed image size → autotune conv algos for throughput
         gradient_clip_val=0,              # starts in Phase 1 (disabled); callback sets Phase 2 value
         accumulate_grad_batches=1,        # starts in Phase 1 (no accum); callback sets Phase 2 value
         enable_checkpointing=False,

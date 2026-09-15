@@ -99,7 +99,8 @@ def _maybe_subset(ds, max_samples):
         take = min(per_class, len(idxs))
         selected.extend(idxs[:take])
     if len(selected) < n:
-        remaining = [i for i in range(len(ds)) if i not in set(selected)]
+        selected_set = set(selected)  # precompute — rebuilding per element is O(len(ds)·n)
+        remaining = [i for i in range(len(ds)) if i not in selected_set]
         selected.extend(remaining[: (n - len(selected))])
     return Subset(ds, selected[:n])
 

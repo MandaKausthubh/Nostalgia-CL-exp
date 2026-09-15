@@ -37,6 +37,8 @@ GRAD_CLIP="${GRAD_CLIP:-1.0}"
 LOG_EVERY="${LOG_EVERY:-5}"
 VAL_EVERY="${VAL_EVERY:-1.0}"     # validate once per epoch
 VAL_EPOCHS="${VAL_EPOCHS:-3}"     # validate every N Phase-2 epochs (--val_every_n_epochs)
+# Optional per-task cap on val samples (unset = full val set; changes reported acc).
+MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-domainnet-cl-iclr}"
 
 # ----- LoRA (default: ON) ------------------------------------------------
@@ -44,6 +46,11 @@ USE_LORA="${USE_LORA:-1}"         # 1 = LoRA adapters, 0 = full-ft fallback
 LORA_R="${LORA_R:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+
+# ----- Memory format --------------------------------------------------------
+# channels_last speeds up conv backbones (resnet10/18) on Ampere+; ignored for
+# vit/siglip. Set CHANNELS_LAST=0 to fall back to contiguous NCHW.
+CHANNELS_LAST="${CHANNELS_LAST:-1}"
 
 # ----- Nostalgia Hessian rank --------------------------------------------
 # k=24 kept identical to the full-ft setup for method comparability; over the
@@ -220,6 +227,12 @@ for seed in $SEEDS; do
 
             # Per-method extras.
             extra_args="--base_optimizer adamw --lr $lr --head_lr $head_lr --weight_decay $weight_decay --grad_clip_val $grad_clip --seed $seed"
+            if [ "$CHANNELS_LAST" = "1" ]; then
+                extra_args="${extra_args} --channels_last"
+            fi
+            if [ -n "$MAX_VAL_SAMPLES" ]; then
+                extra_args="${extra_args} --max_val_samples $MAX_VAL_SAMPLES"
+            fi
             if [ "$method" = "nostalgia" ] || [ "$method" = "gpm" ] || [ "$method" = "ewc_nostalgia" ]; then
                 # Hessian cuts for ICLR sweep speed. With LoRA (default) the
                 # eigenspace lives in ~0.3-0.6M-param adapter space:
@@ -258,6 +271,7 @@ for seed in $SEEDS; do
             echo "  wd/clip     = $weight_decay / $grad_clip"
             echo "  val_every   = $val_epochs epochs  (val_check_interval=$VAL_EVERY)"
             echo "  lora        = $USE_LORA (r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT)"
+            echo "  channels_last = $CHANNELS_LAST"
             echo "  tasks       = ${TASKS[*]}"
             echo "---------------------------------------------------------------------"
 

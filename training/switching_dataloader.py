@@ -74,17 +74,24 @@ class SequentialTaskDataModule(pl.LightningDataModule):
         if task_batch_sizes is None:
             task_batch_sizes = {}
 
-        # Pre-build a DataLoader per task (keyed by task name)
+        # Pre-build a DataLoader per task (keyed by task name).
+        # Reuse the loader built by training.pipeline.build_tasks when present —
+        # it already carries num_workers/pin_memory/prefetch_factor/
+        # persistent_workers. Rebuilding here silently dropped all of those,
+        # forcing num_workers=0 and starving the GPU.
         self.task_loaders = {}
         for task in tasks:
             task_name = task["name"]
-            batch_size = task_batch_sizes.get(task_name, getattr(args, "batch_size", 8))
-            self.task_loaders[task_name] = DataLoader(
-                TaskClassificationDataset(task["train_ds"], num_classes=task["num_classes"]),
-                batch_size=batch_size,
-                shuffle=True,
-                pin_memory=(default_device.type == "cuda"),
-            )
+            loader = task.get("loader")
+            if loader is None:
+                batch_size = task_batch_sizes.get(task_name, getattr(args, "batch_size", 8))
+                loader = DataLoader(
+                    TaskClassificationDataset(task["train_ds"], num_classes=task["num_classes"]),
+                    batch_size=batch_size,
+                    shuffle=True,
+                    pin_memory=(default_device.type == "cuda"),
+                )
+            self.task_loaders[task_name] = loader
 
     def train_dataloader(self):
         return DynamicTaskDataLoader(self)
