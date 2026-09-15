@@ -6,17 +6,19 @@ set -euo pipefail
 # DomainNet domains. Target hardware: 4× A100 80GB on RunPod.
 #
 # LoRA is ON by default (USE_LORA=0 for full-ft fallback): adapter-only
-# training keeps the Nostalgia Q matrix in ~0.6M-param space (~60 MB/task)
-# instead of 85.8M-param space (5.5 GB/task, cuSOLVER int32 overflow).
+# training keeps the Nostalgia Q matrix in the ~0.3-0.6M-param adapter space
+# (~60 MB/task) instead of 85.8M-param space (5.5 GB/task, cuSOLVER overflow).
 #
-# Defaults give a 7 × 3 × 3 = 63-run main table. Override any axis via env:
-#   SEEDS="0 1" BACKBONES="resnet18 vit" METHODS="nostalgia naive_adam" \
+# Runs are dispatched one-per-GPU in parallel; GPUS="0 1 2 3" to pin, default =
+# every visible GPU. Defaults give a 7 × 3 × 3 = 63-run main table. Override:
+#   SEEDS="0" BACKBONES="resnet18 vit" METHODS="nostalgia ewc_nostalgia" \
 #       bash run_domainnet_sweep.sh
-#   DATA_ROOT_DN=$HOME/domainnet bash run_domainnet_sweep.sh
+#   DATA_ROOT_DN=/home/t-kmanda/domainnet bash run_domainnet_sweep.sh
+#   GPUS="0 1" bash run_domainnet_sweep.sh            # limit parallelism
 #   BS_SIGLIP=32 PH2=10 bash run_domainnet_sweep.sh   # per-backbone / per-budget knobs
 #   USE_LORA=0 K=32 bash run_domainnet_sweep.sh       # full-ft fallback / larger null-space
 #
-# Loop order: seeds → backbones → methods; tasks fixed per run.
+# Loop order: seeds → methods → backbones; tasks fixed per run.
 
 # ----- Hardware / runtime ----------------------------------------------
 ACCEL="${ACCEL:-gpu}"
@@ -24,6 +26,22 @@ DEVICES="${DEVICES:-1}"
 STRATEGY="${STRATEGY:-auto}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PRECISION="${PRECISION:-bf16-mixed}"
+
+# ----- Parallel dispatch -------------------------------------------------
+# One single-GPU train.py process per GPU, run concurrently. GPUs are assigned
+# round-robin; a new run only starts when its slot's previous run has finished.
+# Ordering (seed -> method -> backbone) means seed 0's Nostalgia/EWC+Nostalgia
+# runs occupy the first wave, so the headline numbers land earliest.
+# GPUS="0 1 2 3" to pin; default = every visible GPU.
+GPU_LIST=()
+if [ -n "${GPUS:-}" ]; then
+    for _g in $GPUS; do GPU_LIST+=("$_g"); done
+elif command -v nvidia-smi >/dev/null 2>&1; then
+    while read -r _g; do [ -n "$_g" ] && GPU_LIST+=("$_g"); done \
+        < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
+fi
+[ ${#GPU_LIST[@]} -eq 0 ] && GPU_LIST=(0)
+N_GPU=${#GPU_LIST[@]}
 
 # ----- Training budget (ICLR main) -------------------------------------
 PH1="${PH1:-5}"            # head-alignment epochs per domain
@@ -41,10 +59,31 @@ VAL_EPOCHS="${VAL_EPOCHS:-3}"     # validate every N Phase-2 epochs (--val_every
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-domainnet-cl-iclr}"
 
-# ----- LoRA (default: ON) ------------------------------------------------
-USE_LORA="${USE_LORA:-1}"         # 1 = LoRA adapters, 0 = full-ft fallback
-LORA_R="${LORA_R:-16}"
-LORA_ALPHA="${LORA_ALPHA:-32}"
+# ----- Crash-resume ------------------------------------------------------
+# Each run writes a resumable bundle per task boundary; a crash loses at most
+# one domain's Phase-2. RESUME=auto (no prompt — right for unattended sweeps),
+# never (always restart), prompt (ask when interactive).
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$HOME/checkpoints}"
+RESUME="${RESUME:-prompt}"
+PUSH_TO_HUB="${PUSH_TO_HUB:-0}"
+HF_HUB_NAMESPACE="${HF_HUB_NAMESPACE:-}"
+HF_HUB_PRIVATE="${HF_HUB_PRIVATE:-0}"
+mkdir -p "$CHECKPOINT_DIR"
+
+HUB_ARGS="--checkpoint_dir $CHECKPOINT_DIR --resume $RESUME"
+if [ "$PUSH_TO_HUB" = "1" ]; then
+    HUB_ARGS="$HUB_ARGS --push_to_hub"
+    [ -n "$HF_HUB_NAMESPACE" ] && HUB_ARGS="$HUB_ARGS --hf_hub_namespace $HF_HUB_NAMESPACE"
+    [ "$HF_HUB_PRIVATE" = "1" ] && HUB_ARGS="$HUB_ARGS --hf_hub_private"
+fi
+
+# ----- LoRA (always ON — no full finetuning) -----------------------------
+# r=8 (alpha=2r=16) halves the adapter Hessian dim vs r=16 (~0.3M vs ~0.6M for
+# resnet18), so Lanczos + Q build are ~2x cheaper. Raise LORA_R only if a
+# smoke shows the reduced capacity caps Phase-2 accuracy.
+USE_LORA="${USE_LORA:-1}"         # keep 1; 0 = full-ft fallback (discouraged)
+LORA_R="${LORA_R:-8}"
+LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 
 # ----- Memory format --------------------------------------------------------
@@ -109,6 +148,17 @@ declare -A VAL_EPOCHS_MAP=(
 )
 
 # ----- Data -------------------------------------------------------------
+# DomainNet root = dir holding <domain>/ class folders + <domain>_{train,test}.txt.
+# Auto-detect over the known pod layouts; explicit DATA_ROOT_DN wins.
+if [ -z "${DATA_ROOT_DN:-}" ]; then
+    for _cand in "/home/t-kmanda/domainnet" "/home/t-kmanda" \
+                 "$HOME/domainnet" "$HOME"; do
+        if [ -d "$_cand/clipart" ] || [ -d "$_cand/domainnet/clipart" ]; then
+            DATA_ROOT_DN="$_cand"
+            break
+        fi
+    done
+fi
 DATA_ROOT_DN="${DATA_ROOT_DN:-$HOME/domainnet}"
 
 TASKS=(
@@ -121,13 +171,15 @@ TASKS=(
 )
 
 # ----- Method / backbone / seed axes ------------------------------------
+# Order = dispatch priority. Paper's headline pair (Nostalgia, EWC+Nostalgia)
+# runs first so seed 0 produces the main table before the baselines land.
 ALL_METHODS=(
-    "naive_adam"
     "nostalgia"
+    "ewc_nostalgia"
+    "gpm"
+    "naive_adam"
     "ewc"
     "agem"
-    "gpm"
-    "ewc_nostalgia"
     "sdft"
 )
 
@@ -186,36 +238,44 @@ echo "  Methods:    ${METHODS[*]}  (${#METHODS[@]})"
 echo "  Backbones:  ${BACKBONES[*]}  (${#BACKBONES[@]})"
 echo "  Seeds:      $SEEDS  ($_n_seeds)"
 echo "  Tasks:      ${TASKS[*]}"
-echo "  Devices:    $DEVICES × $ACCEL"
+echo "  GPUs:       ${GPU_LIST[*]}  (${N_GPU} parallel single-GPU runs)"
 if [ "$USE_LORA" = "1" ]; then
     echo "  LoRA:       ON  (r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT)"
 else
     echo "  LoRA:       OFF (full finetuning)"
 fi
 echo "  K:          $K"
+echo "  Data root:  $DATA_ROOT_DN"
+echo "  Resume:     $RESUME  (checkpoint_dir=$CHECKPOINT_DIR)"
+echo "  Push hub:   $PUSH_TO_HUB  (namespace=${HF_HUB_NAMESPACE:-<unset>})"
 echo "  Total runs: $_total_runs  (each = 6 sequential domains)"
 echo "====================================================================="
 
 # ----- Sweep ------------------------------------------------------------
-# Loop order: seed → backbone → method. Seed 0 completes ALL backbone×method
-# combos first, so the paper's main table can be drafted while seeds 1..N run.
+# Loop order: seed → method → backbone. Seed 0 + Nostalgia/EWC+Nostalgia runs
+# are dispatched first (first wave on the GPUs); seed 0 finishes before seed 1
+# starts, so a complete single-seed table exists as early as possible.
+# Runs are launched one-per-GPU in the background and slot-blocked round-robin.
+declare -a SLOT_PID=()
+for ((_s = 0; _s < N_GPU; _s++)); do SLOT_PID[$_s]=""; done
+
 _run_idx=0
 for seed in $SEEDS; do
-    for backbone in "${BACKBONES[@]}"; do
-        image_size="${IMG_SIZE[$backbone]}"
-        bs="${BS_DEFAULT[$backbone]}"
-        accum="${ACCUM_DEFAULT[$backbone]}"
-        lr="${LR_MAP[$backbone]}"
-        head_lr="${HEAD_LR_MAP[$backbone]}"
-        warmup="${WARMUP_MAP[$backbone]}"
-        total_steps="${TOTAL_STEPS_MAP[$backbone]}"
-        weight_decay="${WD_MAP[$backbone]}"
-        grad_clip="${GC_MAP[$backbone]}"
-        ph1="${PH1_MAP[$backbone]}"
-        ph2="${PH2_MAP[$backbone]}"
-        val_epochs="${VAL_EPOCHS_MAP[$backbone]}"
+    for method in "${METHODS[@]}"; do
+        for backbone in "${BACKBONES[@]}"; do
+            image_size="${IMG_SIZE[$backbone]}"
+            bs="${BS_DEFAULT[$backbone]}"
+            accum="${ACCUM_DEFAULT[$backbone]}"
+            lr="${LR_MAP[$backbone]}"
+            head_lr="${HEAD_LR_MAP[$backbone]}"
+            warmup="${WARMUP_MAP[$backbone]}"
+            total_steps="${TOTAL_STEPS_MAP[$backbone]}"
+            weight_decay="${WD_MAP[$backbone]}"
+            grad_clip="${GC_MAP[$backbone]}"
+            ph1="${PH1_MAP[$backbone]}"
+            ph2="${PH2_MAP[$backbone]}"
+            val_epochs="${VAL_EPOCHS_MAP[$backbone]}"
 
-        for method in "${METHODS[@]}"; do
             _run_idx=$((_run_idx + 1))
             if [ "$USE_LORA" = "1" ]; then
                 exp_name="domainnet_${backbone}_${method}_seed${seed}_lora"
@@ -259,12 +319,20 @@ for seed in $SEEDS; do
                 extra_args="${extra_args} --sdft_lambda_distillation 1.0 --sdft_temperature 2.0"
             fi
 
+            # Round-robin slot: block until this GPU's previous run finishes.
+            _slot=$(( (_run_idx - 1) % N_GPU ))
+            _gpu="${GPU_LIST[$_slot]}"
+            if [ -n "${SLOT_PID[$_slot]}" ]; then
+                wait "${SLOT_PID[$_slot]}" \
+                    || echo "[warn] previous run on GPU $_gpu exited non-zero"
+            fi
+
             echo ""
             echo "---------------------------------------------------------------------"
-            echo "[$_run_idx/$_total_runs]  backbone=$backbone  method=$method  seed=$seed"
+            echo "[$_run_idx/$_total_runs]  gpu=$_gpu  backbone=$backbone  method=$method  seed=$seed"
             echo "  exp_name    = $exp_name"
             echo "  image_size  = $image_size"
-            echo "  bs/accum    = $bs / $accum  (eff=${bs}×${accum}×${DEVICES}=$((bs * accum * DEVICES)))"
+            echo "  bs/accum    = $bs / $accum  (eff=${bs}×${accum}=$((bs * accum)) / GPU)"
             echo "  lr/head_lr  = $lr / $head_lr"
             echo "  warmup/tot  = $warmup / $total_steps"
             echo "  ph1/ph2     = $ph1 / $ph2"
@@ -275,7 +343,7 @@ for seed in $SEEDS; do
             echo "  tasks       = ${TASKS[*]}"
             echo "---------------------------------------------------------------------"
 
-            python train.py \
+            CUDA_VISIBLE_DEVICES="$_gpu" python train.py \
                 --backbone "$backbone" \
                 --image_size "$image_size" \
                 --tasks "${TASKS[@]}" \
@@ -292,7 +360,7 @@ for seed in $SEEDS; do
                 --batch_size "$bs" \
                 --accumulate_grad_batches "$accum" \
                 --accelerator "$ACCEL" \
-                --devices "$DEVICES" \
+                --devices 1 \
                 --strategy "$STRATEGY" \
                 --precision "$PRECISION" \
                 --log_every_n_steps "$LOG_EVERY" \
@@ -300,12 +368,21 @@ for seed in $SEEDS; do
                 --val_every_n_epochs "$val_epochs" \
                 --wandb_project "$WANDB_PROJECT" \
                 --wandb_name "$exp_name" \
+                $HUB_ARGS \
                 $lora_args \
-                $extra_args
+                $extra_args &
 
-            echo "Finished: $exp_name"
+            SLOT_PID[$_slot]=$!
+            echo "Launched: $exp_name  (pid=${SLOT_PID[$_slot]}, gpu=$_gpu)"
         done
     done
+done
+
+# Drain remaining in-flight runs.
+for ((_s = 0; _s < N_GPU; _s++)); do
+    if [ -n "${SLOT_PID[$_s]}" ]; then
+        wait "${SLOT_PID[$_s]}" || echo "[warn] run on GPU ${GPU_LIST[$_s]} exited non-zero"
+    fi
 done
 
 echo "====================================================================="
