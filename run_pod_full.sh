@@ -12,9 +12,26 @@
 set -euo pipefail
 
 # ---------- Config ----------
-export DATA_ROOT_DN="${DATA_ROOT_DN:-/workspace/data/domainnet}"
-export WANDB_DIR="${WANDB_DIR:-/workspace/data/wandb}"
+export DATA_ROOT_DN="${DATA_ROOT_DN:-$HOME/domainnet}"
+export WANDB_DIR="${WANDB_DIR:-$HOME/wandb_log}"
 REPO_DIR="${REPO_DIR:-/workspace/Nostalgia-CL-exp}"
+
+# ---------- Crash-resume ----------
+# RESUME=prompt (ask if TTY; auto when non-interactive), auto (never ask),
+# never (always restart). PUSH_TO_HUB=1 mirrors bundles to HF Hub.
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$HOME/checkpoints}"
+RESUME="${RESUME:-prompt}"
+PUSH_TO_HUB="${PUSH_TO_HUB:-0}"
+HF_HUB_NAMESPACE="${HF_HUB_NAMESPACE:-}"
+HF_HUB_PRIVATE="${HF_HUB_PRIVATE:-0}"
+mkdir -p "$CHECKPOINT_DIR"
+
+HUB_ARGS="--checkpoint_dir $CHECKPOINT_DIR --resume $RESUME"
+if [ "$PUSH_TO_HUB" = "1" ]; then
+    HUB_ARGS="$HUB_ARGS --push_to_hub"
+    [ -n "$HF_HUB_NAMESPACE" ] && HUB_ARGS="$HUB_ARGS --hf_hub_namespace $HF_HUB_NAMESPACE"
+    [ "$HF_HUB_PRIVATE" = "1" ] && HUB_ARGS="$HUB_ARGS --hf_hub_private"
+fi
 
 # RunPod pod: 1 GPU by default. Override if multi-GPU pod.
 export ACCEL="${ACCEL:-gpu}"
@@ -24,6 +41,18 @@ export PRECISION="${PRECISION:-bf16-mixed}"
 
 BACKBONE="${BACKBONE:-resnet18}"
 IMAGE_SIZE="${IMAGE_SIZE:-224}"
+
+# LoRA (default: ON, same defaults as run_domainnet_sweep.sh).
+# USE_LORA=0 falls back to full finetuning.
+USE_LORA="${USE_LORA:-1}"
+LORA_R="${LORA_R:-16}"
+LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+if [ "$USE_LORA" = "1" ]; then
+    LORA_ARGS="--use_lora --lora_r $LORA_R --lora_alpha $LORA_ALPHA --lora_dropout $LORA_DROPOUT"
+else
+    LORA_ARGS=""
+fi
 
 # Methods (override via METHODS=...).
 METHODS="${METHODS:-nostalgia naive_adam ewc gpm agem sdft}"
@@ -48,6 +77,13 @@ else
     fi
 fi
 
+# Validation cost: validate every N Phase-2 epochs (still always on task-end).
+VAL_EPOCHS="${VAL_EPOCHS:-3}"
+# Optional cap on val samples per task (unset = full val set; changes reported acc).
+MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-}"
+VAL_EXTRA_ARGS="--val_every_n_epochs $VAL_EPOCHS"
+[ -n "$MAX_VAL_SAMPLES" ] && VAL_EXTRA_ARGS="$VAL_EXTRA_ARGS --max_val_samples $MAX_VAL_SAMPLES"
+
 # Per-backbone LR default (env override wins).
 case "$BACKBONE" in
     vit|siglip)  _lr_default="3e-4" ;;
@@ -71,16 +107,19 @@ echo "METHODS       = $METHODS"
 echo "TASKS         = $TASKS"
 echo "MODE          = $MODE"
 echo "ACCEL/DEVICES = $ACCEL / $DEVICES"
+echo "LoRA          = $USE_LORA (r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT)"
+echo "RESUME        = $RESUME  (checkpoint_dir=$CHECKPOINT_DIR)"
+echo "PUSH_TO_HUB   = $PUSH_TO_HUB  (namespace=${HF_HUB_NAMESPACE:-<unset>})"
 
 [ -d "$REPO_DIR" ] || { echo "[FATAL] repo not found at $REPO_DIR"; exit 1; }
 [ -d "$DATA_ROOT_DN" ] || { echo "[FATAL] dataset not found at $DATA_ROOT_DN"; exit 1; }
 for d in clipart infograph painting quickdraw real sketch; do
-    if [ ! -d "$DATA_ROOT_DN/$d/train" ]; then
-        echo "[FATAL] missing $DATA_ROOT_DN/$d/train"
+    if [ ! -d "$DATA_ROOT_DN/$d" ] || [ ! -f "$DATA_ROOT_DN/${d}_train.txt" ]; then
+        echo "[FATAL] missing $DATA_ROOT_DN/$d (or ${d}_train.txt)"
         exit 1
     fi
 done
-echo "[ok] all 6 domain folders present"
+echo "[ok] all 6 domain folders + split lists present"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "[warn] nvidia-smi missing; GPU may be unavailable"
@@ -121,12 +160,15 @@ else
         --precision "$PRECISION" \
         --log_every_n_steps 5 \
         --val_check_interval 1.0 \
+        $VAL_EXTRA_ARGS \
         --wandb_project "domainnet-cl-smoke" \
         --wandb_name "smoke_${BACKBONE}_${SMOKE_METHOD}" \
         --base_optimizer adamw --lr 1e-3 --head_lr 5e-4 \
         --weight_decay 1e-4 --grad_clip_val 1.0 \
         --k 16 --nostalgia_accumulation_rounds 1 \
-        --nostalgia_max_hessian_batch 8 --nostalgia_num_samples 100
+        --nostalgia_max_hessian_batch 8 --nostalgia_num_samples 100 \
+        --checkpoint_dir "$CHECKPOINT_DIR" --resume never \
+        $LORA_ARGS
     echo "[ok] smoke passed"
 fi
 
@@ -186,8 +228,11 @@ for method in $METHODS; do
         --precision "$PRECISION" \
         --log_every_n_steps "$LOG_EVERY" \
         --val_check_interval 1.0 \
+        $VAL_EXTRA_ARGS \
         --wandb_project "domainnet-cl" \
         --wandb_name "$exp_name" \
+        $HUB_ARGS \
+        $LORA_ARGS \
         $extra_args
 
     echo "[done] $exp_name"

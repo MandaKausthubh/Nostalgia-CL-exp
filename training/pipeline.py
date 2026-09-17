@@ -118,9 +118,56 @@ class HuggingFaceTaskCheckpointCallback(pl.Callback):
             if getattr(self.args, "push_to_hub", False):
                 repo_id = self._upload(checkpoint_dir, task_name)
                 print(f"[Checkpoint] Pushed task '{task_name}' to {repo_id}", flush=True)
+            # Crash-resume bundle — runs AFTER PhaseSchedulerCallback.on_train_epoch_end
+            # (callbacks list order), so Q_memory / fisher / replay buffer are fresh.
+            self._save_resume_bundle(pl_module, scheduler, task_name)
             self.uploaded_tasks.add(task_name)
 
         trainer.strategy.barrier("task_checkpoint")
+
+    def _save_resume_bundle(self, pl_module, scheduler, task_name):
+        """Persist a complete resumable bundle (local + optional HF Hub mirror)."""
+        from training.resume import (
+            build_bundle,
+            experiment_key,
+            resume_dir,
+            save_bundle,
+            snapshot_task_copy,
+            upload_bundle,
+            write_progress,
+        )
+
+        args = self.args
+        tasks = scheduler.tasks
+        dataset_config = getattr(args, "dataset_config", build_dataset_config(args))
+        key_hash, key = experiment_key(args, tasks, dataset_config)
+
+        bundle = build_bundle(
+            model=pl_module,
+            scheduler_cb=scheduler,
+            args=args,
+            key_hash=key_hash,
+            key=key,
+            tasks=tasks,
+            wandb_run_id=(wandb.run.id if wandb.run is not None else None),
+            val_metrics=getattr(pl_module, "_val_accs_per_task", {}) or {},
+        )
+
+        directory = resume_dir(args)
+        latest_path = os.path.join(directory, "latest.pt")
+        save_bundle(latest_path, bundle)
+        write_progress(directory, bundle)
+        snapshot_task_copy(directory, latest_path, bundle["resume_after_idx"])
+        print(
+            f"[Resume] Bundle saved after task '{task_name}' "
+            f"({bundle['resume_after_idx']}/{len(tasks)} tasks) -> {directory}",
+            flush=True,
+        )
+
+        if getattr(args, "push_to_hub", False):
+            path = os.path.join(directory, "progress.json")
+            repo_id = upload_bundle(args, [path, latest_path])
+            print(f"[Resume] Pushed resume bundle to {repo_id}", flush=True)
 
 
 def _parse_dataset_overrides(value):
@@ -179,6 +226,15 @@ def build_tasks(args, data_modules, default_device):
             hessian_num_samples = min(hessian_num_samples, len(hessian_dataset))
             hessian_dataset = Subset(hessian_dataset, range(hessian_num_samples))
 
+        # Resolve I/O parallelism once: pin_memory + num_workers only matter on CUDA.
+        # For CPU (MPS) and TPU we keep num_workers=0 because worker processes can't
+        # access the accelerator memory mapping and would actually slow things down.
+        on_cuda = (default_device.type == "cuda")
+        nw = getattr(args, "num_workers", 0) if on_cuda else 0
+        pin = on_cuda
+        prefetch = 4 if nw > 0 else None  # prefetch_factor requires num_workers > 0
+        persistent = bool(nw > 0)
+
         tasks.append({
             "name": task_name,
             "train_ds": dm.train_ds,
@@ -187,19 +243,28 @@ def build_tasks(args, data_modules, default_device):
                 train_dataset,
                 batch_size=cfg["batch_size"],
                 shuffle=True,
-                pin_memory=(default_device.type == "cuda"),
+                num_workers=nw,
+                pin_memory=pin,
+                persistent_workers=persistent,
+                prefetch_factor=prefetch,
             ),
             "hessian_loader": DataLoader(
                 hessian_dataset,
                 batch_size=cfg["batch_size"],
                 shuffle=True,
-                pin_memory=(default_device.type == "cuda"),
+                num_workers=nw,
+                pin_memory=pin,
+                # Not persistent: iterated only at task end (~N-1 times total).
+                # Keeping its pool alive would hoard idle workers next to the
+                # long-lived train/val pools.
+                persistent_workers=False,
+                prefetch_factor=prefetch,
             ),
         })
     return tasks
 
 
-def build_val_dataloaders(tasks, data_modules, default_device, dataset_config):
+def build_val_dataloaders(tasks, data_modules, default_device, dataset_config, args):
     """Build validation DataLoaders for all tasks using per-task batch sizes.
 
     Returns:
@@ -208,6 +273,19 @@ def build_val_dataloaders(tasks, data_modules, default_device, dataset_config):
     """
     val_dataloaders = []
     val_task_names = []
+
+    # Validation is a read-only, infrequent pass that Lightning runs over ALL
+    # tasks at once (every val loader is open simultaneously), so per-loader
+    # worker pools multiply. Reusing the training I/O config here (workers=8,
+    # prefetch_factor=4, persistent, at 224px train batch sizes) pins tens of GB
+    # of host RAM the instant Phase-2 validation first runs -> cgroup OOM kills
+    # sshd (kex_exchange_identification reset). Val is off the critical path:
+    # use a small, non-persistent pool and minimal prefetch.
+    on_cuda = (default_device.type == "cuda")
+    nw = getattr(args, "num_workers", 0) if on_cuda else 0
+    val_nw = min(nw, 2)
+    pin = on_cuda
+    prefetch = 1 if val_nw > 0 else None
 
     for task in tasks:
         t_name = task["name"]
@@ -220,7 +298,10 @@ def build_val_dataloaders(tasks, data_modules, default_device, dataset_config):
             TaskClassificationDataset(dm.val_ds, num_classes=task["num_classes"]),
             batch_size=cfg["batch_size"],
             shuffle=False,
-            pin_memory=(default_device.type != "mps"),
+            num_workers=val_nw,
+            pin_memory=pin,
+            persistent_workers=False,
+            prefetch_factor=prefetch,
         ))
         val_task_names.append(t_name)
 
@@ -247,6 +328,10 @@ def _phase1_cache_path(args, tasks, dataset_config):
         "backbone": getattr(args, "backbone", None),
         "pretrained": getattr(args, "pretrained", True),
         "image_size": getattr(args, "image_size", None),
+        "use_lora": getattr(args, "use_lora", False),
+        "lora_r": getattr(args, "lora_r", None),
+        "lora_alpha": getattr(args, "lora_alpha", None),
+        "lora_dropout": getattr(args, "lora_dropout", None),
         "tasks": sorted(t["name"] for t in tasks),
         "epochs_phase1": args.epochs_phase1,
         "head_lr": args.head_lr,
@@ -280,17 +365,17 @@ def run_sequential_pipeline(args):
     # Detect device and validate quantization
     default_device, quantization = resolve_device_and_quantization(args)
 
-    # Initialize wandb logger (Lightning handles wandb.init internally)
+    # wandb logger is constructed later (after resume detection) so it can join
+    # the original run id. local_rank is needed for all the rank-0 prints below.
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    print_global("Initializing Weights & Biases (wandb) run...", rank=local_rank)
 
     # Drop unused LM-only defaults when running image tasks to avoid confusing printout.
     _active_tasks = getattr(args, "tasks", [])
     _is_image = _active_tasks and _active_tasks[0] not in TEXT_TASK_REGISTRY
     display_args = vars(args).copy()
     if _is_image:
-        for k in ["model_name", "use_lora", "lora_r", "lora_alpha", "lora_dropout",
-                  "quantization", "pooling", "head_layers", "max_length"]:
+        # LoRA keys stay: they now configure the image pipeline too.
+        for k in ["model_name", "quantization", "pooling", "head_layers", "max_length"]:
             display_args.pop(k, None)
 
     print_global(
@@ -298,14 +383,10 @@ def run_sequential_pipeline(args):
         string_process_func=lambda x: "Arguments for this training are:\n" + str(x)
     )
 
-    wandb_dir = os.environ.get("WANDB_DIR", "/kaggle/tmp/wandb")
-    os.makedirs(wandb_dir, exist_ok=True)
-    wandb_logger = NostalgiaWandbLogger(
-        project=args.wandb_project,
-        name=args.wandb_name,
-        dir=wandb_dir,
-        save_dir=wandb_dir,
+    wandb_dir = os.path.expanduser(
+        os.environ.get("WANDB_DIR", "~/wandb_log")
     )
+    os.makedirs(wandb_dir, exist_ok=True)
 
     # 1. Setup Datasets
     print_global("Setting up datasets...", rank=local_rank)
@@ -339,9 +420,64 @@ def run_sequential_pipeline(args):
 
     tasks = build_tasks(args, data_modules, default_device)
     val_dataloaders, val_task_names = build_val_dataloaders(
-        tasks, data_modules, default_device, args.dataset_config,
+        tasks, data_modules, default_device, args.dataset_config, args,
     )
     print_global("Datasets setup completed successfully.", rank=local_rank)
+
+    # 1b. Crash-resume detection. Find a bundle matching this exact config and
+    # ask (or auto-resume). Rank 0 prompts and publishes the decision; other DDP
+    # ranks read it from disk (no process group exists this early).
+    from training.resume import (
+        experiment_key, find_resume, prompt_resume, read_decision, resume_dir,
+        restore_bundle, summarize, wait_for_decision, write_decision,
+    )
+
+    key_hash, exp_key = experiment_key(args, tasks, args.dataset_config)
+    decision_dir = resume_dir(args)
+    resume_bundle = None
+    resume_requested = False
+    resume_wandb_run_id = None
+
+    if local_rank == 0:
+        # Clear any stale decision from a previous launch so non-rank-0 ranks
+        # cannot read it before we publish the new one.
+        try:
+            os.remove(os.path.join(decision_dir, "decision.json"))
+        except OSError:
+            pass
+        resume_bundle = find_resume(args, tasks, args.dataset_config)
+        if resume_bundle is not None:
+            summary = summarize(resume_bundle, args)
+            resume_requested = prompt_resume(summary, getattr(args, "resume", "prompt"))
+        write_decision(decision_dir, resume_requested)
+    else:
+        resume_requested = wait_for_decision(decision_dir)
+        if resume_requested:
+            # Rank 0 already downloaded the bundle; read it from the local dir.
+            from training.resume import _load_bundle
+
+            resume_bundle = _load_bundle(os.path.join(decision_dir, "latest.pt"))
+
+    if resume_requested:
+        resume_wandb_run_id = resume_bundle.get("wandb_run_id")
+        # Set these BEFORE PhaseSchedulerCallback is built: epochs_phase1=0 drops
+        # all head_align epochs (heads are inside the bundle), resume_after_idx
+        # skips completed tasks' Phase-2 blocks.
+        args.epochs_phase1 = 0
+        args.resume_after_idx = int(resume_bundle.get("resume_after_idx", 0))
+        print_global(
+            f"[Resume] Accepted: completed "
+            f"{len(resume_bundle.get('completed_tasks', []))}/"
+            f"{len(resume_bundle.get('tasks', []))} tasks — "
+            f"resuming after task {args.resume_after_idx}",
+            rank=local_rank,
+        )
+        if resume_wandb_run_id:
+            print_global(f"[Resume] WandB run id: {resume_wandb_run_id}", rank=local_rank)
+    else:
+        print_global(
+            f"[Resume] Starting fresh (key={key_hash[:12]}).", rank=local_rank,
+        )
 
     # 2. Instantiate Model with Task-Specific Heads
     tasks_config = {task["name"]: (task["num_classes"], args.head_layers) for task in tasks}
@@ -374,6 +510,11 @@ def run_sequential_pipeline(args):
             pretrained=getattr(args, "pretrained", True),
             sdft_lambda_distillation=getattr(args, "sdft_lambda_distillation", 1.0),
             sdft_temperature=getattr(args, "sdft_temperature", 2.0),
+            use_lora=getattr(args, "use_lora", False),
+            lora_r=getattr(args, "lora_r", 8),
+            lora_alpha=getattr(args, "lora_alpha", 16),
+            lora_dropout=getattr(args, "lora_dropout", 0.05),
+            channels_last=getattr(args, "channels_last", False),
         )
     else:
         # Language model pipeline
@@ -410,6 +551,18 @@ def run_sequential_pipeline(args):
     # Tell the model which task each val dataloader corresponds to
     model.val_task_names = val_task_names
 
+    # Build the wandb logger now that we know whether we are joining an existing
+    # run. WandbLogger already sets resume="allow"; passing id makes it continue
+    # the original run instead of creating a new one.
+    print_global("Initializing Weights & Biases (wandb) run...", rank=local_rank)
+    wandb_logger = NostalgiaWandbLogger(
+        project=args.wandb_project,
+        name=args.wandb_name,
+        dir=wandb_dir,
+        save_dir=wandb_dir,
+        id=resume_wandb_run_id,
+    )
+
     # Assign model reference to the custom logger so it can access global_step_counter
     wandb_logger.model = model
 
@@ -441,6 +594,21 @@ def run_sequential_pipeline(args):
 
     # 3. Build schedule and single Trainer
     scheduler_callback = PhaseSchedulerCallback(tasks, args)
+
+    # Restore the full CL state (weights, Q/Lambda, fisher/theta_star, replay
+    # buffer, teacher, counters, RNG) onto the freshly built model + callback.
+    # Must happen BEFORE pl.Trainer is constructed: configure_optimizers reads
+    # Q_memory at the first transition, which is the first epoch on resume.
+    if resume_requested:
+        restore_bundle(resume_bundle, model, scheduler_callback, args)
+        print_global(
+            f"[Resume] Restored bundle: Q={'yes' if scheduler_callback.Q_memory is not None else 'no'}, "
+            f"fisher={'yes' if scheduler_callback.fisher_memory is not None else 'no'}, "
+            f"replay={'yes' if scheduler_callback.replay_buffer is not None else 'no'}, "
+            f"teacher={'yes' if scheduler_callback.teacher_memory is not None else 'no'}",
+            rank=local_rank,
+        )
+
     task_batch_sizes = {
         name: cfg["batch_size"]
         for name, cfg in args.dataset_config.items()
@@ -475,7 +643,8 @@ def run_sequential_pipeline(args):
         devices=args.devices,
         strategy=args.strategy,
         precision=args.precision,
-        deterministic=True,
+        deterministic=False,               # deterministic=True disables cudnn.benchmark autotuning
+        benchmark=True,                    # fixed image size → autotune conv algos for throughput
         gradient_clip_val=0,              # starts in Phase 1 (disabled); callback sets Phase 2 value
         accumulate_grad_batches=1,        # starts in Phase 1 (no accum); callback sets Phase 2 value
         enable_checkpointing=False,

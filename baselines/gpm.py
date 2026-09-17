@@ -170,8 +170,13 @@ def compute_gpm_subspace(
     inv_s = 1.0 / s_kept.clamp_min(1e-12)
     U = (G @ V_kept) * inv_s.unsqueeze(0)   # (num_params, k_eff), CPU
 
-    # QR for orthonormality
-    Q_cpu, _ = torch.linalg.qr(U, mode="reduced")
+    # QR for orthonormality — use SVD-based orthonormalisation to avoid
+    # LAPACK SORGQR crashes under CPU memory pressure on large matrices.
+    try:
+        from utils.hessians import _orthonormalize  # local reuse
+        Q_cpu = _orthonormalize(U)
+    except Exception:
+        Q_cpu, _ = torch.linalg.qr(U, mode="reduced")
 
     # Pseudo-eigenvalues = singular values ** 2 (matches Hessian eigenvalue scale roughly)
     Lambda_cpu = (s_kept ** 2).contiguous()

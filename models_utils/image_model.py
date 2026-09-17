@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning.pytorch as pl
-from transformers import AutoModel, get_linear_schedule_with_warmup
+from transformers import AutoConfig, AutoModel, get_linear_schedule_with_warmup
 import torchvision
 from torchvision import models
 
@@ -130,20 +130,33 @@ class ResNet18(nn.Module):
         return self.net(x)
 
 
-class ViTBackbone(nn.Module):
-    """ViT-B/16 backbone from torchvision, returning the CLS token."""
+class HfViTBackbone(nn.Module):
+    """ViT-B/16 backbone from transformers ("google/vit-base-patch16-224").
 
-    def __init__(self, weights="DEFAULT"):
+    HF ViT (not torchvision) so LoRA can target the separate
+    `attention.attention.query/key/value` Linear layers — torchvision's fused
+    MHA stores qkv as a single raw Parameter that peft cannot wrap.
+    `attn_implementation="eager"` keeps attention fully double-differentiable
+    for the Hessian-vector products.
+    """
+
+    def __init__(self, pretrained: bool = True):
         super().__init__()
-        if weights == "DEFAULT":
-            weights = models.ViT_B_16_Weights.IMAGENET1K_V1
-        self.vit = models.vit_b_16(weights=weights)
-        self.vit.heads = nn.Identity()
+        model_name = "google/vit-base-patch16-224"
+        if pretrained:
+            self.model = AutoModel.from_pretrained(model_name, attn_implementation="eager")
+        else:
+            config = AutoConfig.from_pretrained(model_name)
+            config._attn_implementation = "eager"
+            self.model = AutoModel.from_config(config)
         self.feat_dim = 768
 
     def forward(self, inputs):
         x = inputs["input_ids"]
-        return self.vit(x)
+        out = self.model(pixel_values=x)
+        if getattr(out, "pooler_output", None) is not None:
+            return out.pooler_output
+        return out.last_hidden_state[:, 0]
 
 
 class SigLIPBackbone(nn.Module):
@@ -172,12 +185,82 @@ def _build_image_backbone(name: str, in_channels: int = 3, feat_dim: int = 512,
         backbone = ResNet18(in_channels=in_channels, weights=weights)
         return backbone, backbone.feat_dim
     if name == "vit":
-        backbone = ViTBackbone(weights=weights)
+        backbone = HfViTBackbone(pretrained=pretrained)
         return backbone, backbone.feat_dim
     if name == "siglip":
         backbone = SigLIPBackbone()
         return backbone, backbone.feat_dim
     raise ValueError(f"Unknown image backbone: {name}. Choose from resnet10, resnet18, vit, siglip.")
+
+
+def _apply_lora_to_backbone(backbone, backbone_name, lora_r, lora_alpha, lora_dropout):
+    """Inject LoRA adapters into an image backbone in place (peft).
+
+    Uses `inject_adapter_in_model` (NOT `get_peft_model`) so the module tree,
+    forward signatures, and state-dict keys stay untouched — the CL machinery
+    (Hessian flattening, functional_call HVPs, checkpointing) sees the same
+    model with a few extra `lora_` parameters. peft freezes the base weights,
+    so `requires_grad`-based machinery (Hessian selection, optimizer groups,
+    theta_star/Fisher snapshots) auto-scopes to the adapters.
+    """
+    from peft import inject_adapter_in_model, LoraConfig, TaskType
+
+    name = backbone_name.lower()
+    if name in ("resnet10", "resnet18"):
+        # Full dotted names of every Conv2d submodule (peft matches on
+        # end-of-name, full names are unambiguous).
+        target_modules = [
+            f"{parent}.{leaf}" if parent else leaf
+            for parent, module in backbone.named_modules()
+            for leaf, child in module.named_children()
+            if isinstance(child, nn.Conv2d)
+        ]
+    elif name == "vit":
+        target_modules = ["query", "value"]
+    elif name == "siglip":
+        target_modules = ["q_proj", "v_proj"]
+    else:
+        raise ValueError(f"LoRA not supported for backbone: {backbone_name}")
+
+    # SigLIP: inject into the vision tower ONLY. Injecting into the whole
+    # SiglipModel would also hit the text tower's q/v projections —
+    # trainable-but-unused params that pollute the Hessian/optimizer space.
+    target_model = backbone.model.vision_model if name == "siglip" else backbone
+
+    peft_config = LoraConfig(
+        task_type=TaskType.FEATURE_EXTRACTION,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=target_modules,
+    )
+    inject_adapter_in_model(peft_config, target_model)
+
+    # Freeze everything that is not a LoRA adapter — across the whole backbone
+    # (including the SigLIP text tower, which receives no adapters) so the
+    # requires_grad-scoped CL machinery contains adapters only.
+    for param_name, p in backbone.named_parameters():
+        if "lora_" not in param_name:
+            p.requires_grad = False
+
+    trainable = [(n, p.numel()) for n, p in backbone.named_parameters() if p.requires_grad]
+    if not trainable:
+        raise ValueError(
+            f"LoRA injection matched no modules for backbone={backbone_name} "
+            f"(targets={target_modules})"
+        )
+    bad = [n for n, _ in trainable if "lora_" not in n]
+    if bad:
+        raise RuntimeError(
+            f"LoRA injection left non-adapter params trainable for "
+            f"backbone={backbone_name}: {bad[:5]}. This would silently turn "
+            f"the run into full finetuning."
+        )
+    n_params = sum(c for _, c in trainable)
+    print(f"[LoRA] backbone={backbone_name} r={lora_r} alpha={lora_alpha} "
+          f"dropout={lora_dropout}: {len(trainable)} adapter tensors, "
+          f"{n_params:,} trainable params (targets={len(target_modules)})", flush=True)
+    return backbone
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +296,11 @@ class ImageModelModule(pl.LightningModule):
         pretrained: bool = True,
         sdft_lambda_distillation: float = 1.0,
         sdft_temperature: float = 2.0,
+        use_lora: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.05,
+        channels_last: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -226,6 +314,23 @@ class ImageModelModule(pl.LightningModule):
             pretrained=pretrained,
         )
 
+        if use_lora:
+            self.backbone = _apply_lora_to_backbone(
+                self.backbone, backbone_name, lora_r, lora_alpha, lora_dropout,
+            )
+
+        # channels_last only helps conv backbones on CUDA; ViT/SigLIP patch-embed
+        # + eager attention gain nothing, and MPS/CPU do not support the format.
+        self.channels_last = bool(
+            channels_last
+            and backbone_name.lower() in ("resnet10", "resnet18")
+            and torch.cuda.is_available()
+        )
+        if self.channels_last:
+            self.backbone = self.backbone.to(memory_format=torch.channels_last)
+            print(f"[channels_last] backbone={backbone_name} converted to "
+                  f"channels_last memory format", flush=True)
+
         if tasks_config is not None:
             self.task_head_list = torch.nn.ModuleDict({
                 task_name: nn.Linear(actual_feat_dim, num_classes)
@@ -238,6 +343,11 @@ class ImageModelModule(pl.LightningModule):
             self.criterion = None
             self.active_task = None
 
+        # CRITICAL: snapshot AFTER LoRA injection. With LoRA the adapters are
+        # the only trainable backbone params, so the Phase-2 name-based
+        # unfreeze (phase_scheduler.py) restores adapters only. Snapshotting
+        # before the injection would unfreeze full base weights = silent
+        # full finetuning (guarded by the assert in _apply_lora_to_backbone).
         self.trainable_backbone_param_names = {
             name for name, p in self.backbone.named_parameters() if p.requires_grad
         }
@@ -279,16 +389,22 @@ class ImageModelModule(pl.LightningModule):
 
     def preprocess_inputs(self, inputs):
         if isinstance(inputs, torch.Tensor):
-            return {"input_ids": inputs}
+            return {"input_ids": self._to_channels_last(inputs)}
         if isinstance(inputs, dict):
             return {
-                "input_ids": inputs["input_ids"],
+                "input_ids": self._to_channels_last(inputs["input_ids"]),
                 "attention_mask": inputs.get("attention_mask", None),
             }
         return inputs
 
+    def _to_channels_last(self, x):
+        if self.channels_last and torch.is_tensor(x) and x.dim() == 4:
+            return x.contiguous(memory_format=torch.channels_last)
+        return x
+
     def forward(self, input_ids, attention_mask=None, labels=None, task_name=None, **kwargs):
         t_name = task_name if task_name is not None else self.active_task
+        input_ids = self._to_channels_last(input_ids)
         inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
         representations = self.backbone(inputs)
         return self.task_head_list[t_name](representations)
@@ -430,6 +546,18 @@ class ImageModelModule(pl.LightningModule):
         self._val_losses_per_task = {}
         self._val_accs_per_task = {}
         self._val_preds = {}
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx=0):
+        # Lightning default does `.to(device)` WITHOUT non_blocking, which serialises
+        # H2D copies on the compute stream. With pin_memory=True on the loader this
+        # kills throughput. Override to issue true async copies.
+        out = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                out[k] = v.to(device, non_blocking=True)
+            else:
+                out[k] = v
+        return out
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         if self.logging_disabled:

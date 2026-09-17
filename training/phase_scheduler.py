@@ -55,7 +55,12 @@ class PhaseSchedulerCallback(pl.Callback):
                 self.schedule.append((task["name"], "head_align", task_idx))
 
         # ── Sequential Phase 2: finetune each task in order ──
+        # On resume, tasks whose Phase-2 block already completed are dropped:
+        # their weights + CL state live in the restored bundle.
+        self.resume_after_idx = int(getattr(args, "resume_after_idx", 0))
         for task_idx, task in enumerate(tasks, start=1):
+            if task_idx <= self.resume_after_idx:
+                continue
             for _ in range(args.epochs_phase2):
                 self.schedule.append((task["name"], "nostalgia", task_idx))
 
@@ -556,6 +561,10 @@ class PhaseSchedulerCallback(pl.Callback):
             "backbone": getattr(self.args, "backbone", None),
             "pretrained": getattr(self.args, "pretrained", True),
             "image_size": getattr(self.args, "image_size", None),
+            "use_lora": getattr(self.args, "use_lora", False),
+            "lora_r": getattr(self.args, "lora_r", None),
+            "lora_alpha": getattr(self.args, "lora_alpha", None),
+            "lora_dropout": getattr(self.args, "lora_dropout", None),
             "tasks": sorted(t["name"] for t in self.tasks),
             "epochs_phase1": getattr(self.args, "epochs_phase1", None),
         }

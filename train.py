@@ -32,13 +32,22 @@ def parse_args():
     model_group.add_argument("--image_size", type=int, default=None,
                              help="Input image size (default: 32 for ResNets, 224 for ViT/SigLIP)")
     model_group.add_argument("--pretrained", dest="pretrained", action="store_true", default=True,
-                             help="Use ImageNet-pretrained weights for resnet18/vit (default: on)")
+                             help="Use pretrained weights for image backbones (default: on). "
+                                  "vit loads google/vit-base-patch16-224 from the HF hub "
+                                  "(downloads on first use — pre-cache on fresh pods)")
     model_group.add_argument("--no-pretrained", dest="pretrained", action="store_false",
                              help="Train image backbone from random init")
-    model_group.add_argument("--use_lora", action="store_true")
+    model_group.add_argument("--use_lora", action="store_true",
+                             help="Inject LoRA adapters (language model q/v, or image backbone: "
+                                  "resnet convs / vit q,v / siglip vision q,v). Base weights frozen; "
+                                  "CL machinery auto-scopes to adapters")
     model_group.add_argument("--lora_r", type=int, default=8)
     model_group.add_argument("--lora_alpha", type=int, default=16)
     model_group.add_argument("--lora_dropout", type=float, default=0.05)
+    model_group.add_argument("--channels_last", action="store_true",
+                             help="Use channels_last memory format for conv backbones "
+                                  "(resnet10/18 only; ignored for vit/siglip). Speeds up "
+                                  "conv kernels on Ampere+ GPUs.")
     model_group.add_argument(
         "--quantization",
         type=str,
@@ -188,6 +197,20 @@ def parse_args():
         type=str,
         default="./checkpoints",
         help="Local directory for per-task checkpoints",
+    )
+    hub_group.add_argument(
+        "--resume",
+        type=str,
+        default="prompt",
+        choices=["prompt", "auto", "never"],
+        help="Crash-resume behaviour: 'prompt' asks if a matching bundle exists "
+             "(auto-resumes when non-interactive), 'auto' never asks, 'never' always restarts",
+    )
+    hub_group.add_argument(
+        "--resume_after_idx",
+        type=int,
+        default=0,
+        help="Internal: number of completed tasks to skip on resume (set by the pipeline)",
     )
 
     # Trainer hardware

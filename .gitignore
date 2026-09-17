@@ -5,3 +5,7 @@ __pycache__/
 wandb/
 testing/
 data/
+checkpoints/
+graphify-out/
+iclr_figures/
+.DS_Store

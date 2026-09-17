@@ -33,6 +33,51 @@ def _needs_cpu_offload(tensor: torch.Tensor) -> bool:
     return tensor.device.type in ('xla', 'mps')
 
 
+_INT32_MAX = 2 ** 31 - 1
+_QR_CHUNK_ROWS = 2 ** 22   # 4M rows per chunk (~1 GB fp64 for 32 cols)
+
+
+def _gram_whiten(X: torch.Tensor) -> torch.Tensor:
+    """
+    Orthonormalise a tall-skinny matrix via a small fp64 Gram eigendecomposition.
+
+    Replaces cuSOLVER QR for CUDA inputs whose numel >= 2**31: the QR workspace
+    size computation overflows int32 there and surfaces as
+    "CUDA out of memory. Tried to allocate more than 1EB memory".
+    Same Gram trick as the re-orth step in utils/hessians.py.
+    """
+    n, m = X.shape
+    device = X.device
+
+    # fp64 Gram, accumulated in row chunks to avoid a full fp64 copy of X.
+    G = torch.zeros(m, m, dtype=torch.float64, device=device)
+    for a in range(0, n, _QR_CHUNK_ROWS):
+        chunk = X[a:min(a + _QR_CHUNK_ROWS, n)].double()
+        G += chunk.T @ chunk
+    G = 0.5 * (G + G.T)
+
+    evals, evecs = torch.linalg.eigh(G)      # tiny (m, m)
+    if evals.min().item() < 1e-10:
+        # Degenerate column span — whitening would amplify noise.
+        # Fall back to CPU LAPACK QR (64-bit safe).
+        X_cpu = X.detach().to("cpu", dtype=torch.float32)
+        Q_cpu, _ = torch.linalg.qr(X_cpu, mode="reduced")
+        return Q_cpu.to(device=device, dtype=X.dtype)
+
+    # W = evecs @ diag(evals^{-1/2})
+    W = (evecs / evals.clamp_min(1e-12).sqrt().unsqueeze(0)).to(X.dtype)
+
+    if X.is_contiguous():
+        # In-place chunked apply: Q = X @ W without a second (N, m) buffer.
+        # Row i of the result depends only on row i of X, so overwriting
+        # rows in place is safe.
+        for a in range(0, n, _QR_CHUNK_ROWS):
+            b = min(a + _QR_CHUNK_ROWS, n)
+            X[a:b] = X[a:b] @ W
+        return X.contiguous()
+    return (X @ W).contiguous()
+
+
 def _safe_qr(X: torch.Tensor) -> torch.Tensor:
     """
     Numerically stable QR with automatic CPU offload when required.
@@ -40,6 +85,9 @@ def _safe_qr(X: torch.Tensor) -> torch.Tensor:
     On XLA: materializes X via mark_step() before the CPU transfer, then
     mark_step() again after the result is back on device so the transfer
     node is compiled immediately and doesn't bloat the next graph.
+
+    On CUDA with numel >= 2**31: uses the Gram-whiten path instead of QR
+    (cuSOLVER QR overflows int32 workspace arithmetic at that size).
     """
     original_device = X.device
     original_dtype = X.dtype
@@ -52,12 +100,18 @@ def _safe_qr(X: torch.Tensor) -> torch.Tensor:
 
         X_cpu = X.detach().to("cpu", dtype=torch.float32)
         Q_cpu, _ = torch.linalg.qr(X_cpu, mode="reduced")
+        # Note: keep this QR call for now — X_cpu here is small (Gram-eigvec
+        # basis) and the SVD path would be wasteful. The SVD-based fallback
+        # in utils/hessians.py:_orthonormalize handles the larger matrices.
         result = Q_cpu.to(device=original_device, dtype=original_dtype)
 
         # Compile the CPU→device transfer immediately so it doesn't
         # get merged into subsequent operations' graph.
         _mark_step()
         return result
+
+    if X.is_cuda and X.numel() > _INT32_MAX:
+        return _gram_whiten(X)
 
     Q, _ = torch.linalg.qr(X, mode="reduced")
     return Q
