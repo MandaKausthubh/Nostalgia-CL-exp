@@ -340,8 +340,15 @@ def _phase1_cache_path(args, tasks, dataset_config):
     }
     key_str = json.dumps(key_dict, sort_keys=True)
     key_hash = hashlib.sha1(key_str.encode("utf-8")).hexdigest()
-    data_root = first_cfg.get("data_root", "./data")
-    cache_dir = os.path.join(data_root, "phase1_cache")
+    # Cache must live somewhere writable. data_root is read-only on Kaggle
+    # (/kaggle/input/...) and can be read-only on other mounts, so prefer an
+    # explicit --phase1_cache_dir, then the checkpoint dir, then data_root.
+    cache_root = getattr(args, "phase1_cache_dir", None) or getattr(args, "checkpoint_dir", None)
+    if cache_root:
+        cache_dir = os.path.join(os.path.abspath(cache_root), "phase1_cache")
+    else:
+        data_root = first_cfg.get("data_root", "./data")
+        cache_dir = os.path.join(data_root, "phase1_cache")
     return os.path.join(cache_dir, f"{key_hash}.pt"), key_dict
 
 def run_sequential_pipeline(args):

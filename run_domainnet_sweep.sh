@@ -10,35 +10,59 @@ set -euo pipefail
 # (~60 MB/task) instead of 85.8M-param space (5.5 GB/task, cuSOLVER overflow).
 #
 # Runs are dispatched one-per-GPU in parallel; GPUS="0 1 2 3" to pin, default =
-# every visible GPU. Defaults give a 7 × 3 × 3 = 63-run main table. Override:
+# every visible GPU. On TPU (ACCEL=tpu) the 8 v5e chips are driven by a SINGLE
+# process (--devices 8 --strategy xla, bf16-true) and runs go strictly serial.
+# Defaults give a 7 × 3 × 3 = 63-run main table. Override:
 #   SEEDS="0" BACKBONES="resnet18 vit" METHODS="nostalgia ewc_nostalgia" \
 #       bash run_domainnet_sweep.sh
 #   DATA_ROOT_DN=/home/t-kmanda/domainnet bash run_domainnet_sweep.sh
 #   GPUS="0 1" bash run_domainnet_sweep.sh            # limit parallelism
 #   BS_SIGLIP=32 PH2=10 bash run_domainnet_sweep.sh   # per-backbone / per-budget knobs
 #   USE_LORA=0 K=32 bash run_domainnet_sweep.sh       # full-ft fallback / larger null-space
+#   ACCEL=tpu DEVICES=8 bash run_domainnet_sweep.sh   # TPU v5e-8 (one process, all chips)
 #
 # Loop order: seeds → methods → backbones; tasks fixed per run.
 
 # ----- Hardware / runtime ----------------------------------------------
 ACCEL="${ACCEL:-gpu}"
-DEVICES="${DEVICES:-1}"
-STRATEGY="${STRATEGY:-auto}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
-PRECISION="${PRECISION:-bf16-mixed}"
+
+# ----- Accelerator-specific defaults ------------------------------------
+# TPU v5e-8: ONE process drives all 8 chips (SPMD data-parallel). Launching a
+# second train.py would contend for the same chips, so TPU mode bypasses the
+# per-GPU pool and runs a single job at a time over every chip.
+IS_TPU=0
+[ "$ACCEL" = "tpu" ] && IS_TPU=1
+
+if [ "$IS_TPU" = "1" ]; then
+    DEVICES="${DEVICES:-8}"
+    STRATEGY="${STRATEGY:-xla}"
+    # XLA wants bf16-true; bf16-mixed (the GPU default) is unreliable there.
+    PRECISION="${PRECISION:-bf16-true}"
+else
+    DEVICES="${DEVICES:-1}"
+    STRATEGY="${STRATEGY:-auto}"
+    PRECISION="${PRECISION:-bf16-mixed}"
+fi
 
 # ----- Parallel dispatch -------------------------------------------------
-# One single-GPU train.py process per GPU, run concurrently. GPUs are assigned
-# round-robin; a new run only starts when its slot's previous run has finished.
+# GPU: one single-GPU train.py process per GPU, run concurrently. GPUs are
+# assigned round-robin; a new run only starts when its slot's previous run has
+# finished. TPU: a single slot (N_GPU=1) over all chips.
 # Ordering (seed -> method -> backbone) means seed 0's Nostalgia/EWC+Nostalgia
 # runs occupy the first wave, so the headline numbers land earliest.
 # GPUS="0 1 2 3" to pin; default = every visible GPU.
-GPU_LIST=()
-if [ -n "${GPUS:-}" ]; then
+if [ "$IS_TPU" = "1" ]; then
+    GPU_LIST=(0)
+elif [ -n "${GPUS:-}" ]; then
+    GPU_LIST=()
     for _g in $GPUS; do GPU_LIST+=("$_g"); done
-elif command -v nvidia-smi >/dev/null 2>&1; then
-    while read -r _g; do [ -n "$_g" ] && GPU_LIST+=("$_g"); done \
-        < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
+else
+    GPU_LIST=()
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        while read -r _g; do [ -n "$_g" ] && GPU_LIST+=("$_g"); done \
+            < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
+    fi
 fi
 [ ${#GPU_LIST[@]} -eq 0 ] && GPU_LIST=(0)
 N_GPU=${#GPU_LIST[@]}
@@ -89,7 +113,9 @@ LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 # ----- Memory format --------------------------------------------------------
 # channels_last speeds up conv backbones (resnet10/18) on Ampere+; ignored for
 # vit/siglip. Set CHANNELS_LAST=0 to fall back to contiguous NCHW.
+# XLA has no channels_last path (the code guards it on torch.cuda), so force off.
 CHANNELS_LAST="${CHANNELS_LAST:-1}"
+[ "$IS_TPU" = "1" ] && CHANNELS_LAST=0
 
 # ----- Nostalgia Hessian rank --------------------------------------------
 # k=24 kept identical to the full-ft setup for method comparability; over the
@@ -161,14 +187,22 @@ if [ -z "${DATA_ROOT_DN:-}" ]; then
 fi
 DATA_ROOT_DN="${DATA_ROOT_DN:-$HOME/domainnet}"
 
-TASKS=(
-    "domainnet_clipart"
-    "domainnet_infograph"
-    "domainnet_painting"
-    "domainnet_quickdraw"
-    "domainnet_real"
-    "domainnet_sketch"
-)
+# Domain order = the sequential CL task order. Override with TASKS="..." for a
+# shortened smoke run (e.g. TASKS="domainnet_clipart domainnet_real").
+if [ -n "${TASKS:-}" ]; then
+    _tasks=()
+    for _t in $TASKS; do _tasks+=("$_t"); done
+    TASKS=("${_tasks[@]}")
+else
+    TASKS=(
+        "domainnet_clipart"
+        "domainnet_infograph"
+        "domainnet_painting"
+        "domainnet_quickdraw"
+        "domainnet_real"
+        "domainnet_sketch"
+    )
+fi
 
 # ----- Method / backbone / seed axes ------------------------------------
 # Order = dispatch priority. Paper's headline pair (Nostalgia, EWC+Nostalgia)
@@ -238,7 +272,11 @@ echo "  Methods:    ${METHODS[*]}  (${#METHODS[@]})"
 echo "  Backbones:  ${BACKBONES[*]}  (${#BACKBONES[@]})"
 echo "  Seeds:      $SEEDS  ($_n_seeds)"
 echo "  Tasks:      ${TASKS[*]}"
-echo "  GPUs:       ${GPU_LIST[*]}  (${N_GPU} parallel single-GPU runs)"
+if [ "$IS_TPU" = "1" ]; then
+    echo "  TPUs:       $DEVICES chips, one process (strategy=$STRATEGY, precision=$PRECISION)"
+else
+    echo "  GPUs:       ${GPU_LIST[*]}  (${N_GPU} parallel single-GPU runs)"
+fi
 if [ "$USE_LORA" = "1" ]; then
     echo "  LoRA:       ON  (r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT)"
 else
@@ -287,6 +325,9 @@ for seed in $SEEDS; do
 
             # Per-method extras.
             extra_args="--base_optimizer adamw --lr $lr --head_lr $head_lr --weight_decay $weight_decay --grad_clip_val $grad_clip --seed $seed"
+            if [ -n "${PHASE1_CACHE_DIR:-}" ]; then
+                extra_args="${extra_args} --phase1_cache_dir $PHASE1_CACHE_DIR"
+            fi
             if [ "$CHANNELS_LAST" = "1" ]; then
                 extra_args="${extra_args} --channels_last"
             fi
@@ -319,17 +360,28 @@ for seed in $SEEDS; do
                 extra_args="${extra_args} --sdft_lambda_distillation 1.0 --sdft_temperature 2.0"
             fi
 
-            # Round-robin slot: block until this GPU's previous run finishes.
+            # Round-robin slot: block until this slot's previous run finishes.
+            # TPU: N_GPU=1 -> strictly serial, one process owns all chips.
             _slot=$(( (_run_idx - 1) % N_GPU ))
-            _gpu="${GPU_LIST[$_slot]}"
+            if [ "$IS_TPU" = "1" ]; then
+                _slot_label="tpu x$DEVICES"
+                _launch=(python)
+                _devices_arg="$DEVICES"
+            else
+                _slot_label="gpu ${GPU_LIST[$_slot]}"
+                # Must be a literal env-assignment prefix; a value produced by
+                # expansion is parsed as the command name, not an assignment.
+                _launch=(env "CUDA_VISIBLE_DEVICES=${GPU_LIST[$_slot]}" python)
+                _devices_arg="1"
+            fi
             if [ -n "${SLOT_PID[$_slot]}" ]; then
                 wait "${SLOT_PID[$_slot]}" \
-                    || echo "[warn] previous run on GPU $_gpu exited non-zero"
+                    || echo "[warn] previous run on $_slot_label exited non-zero"
             fi
 
             echo ""
             echo "---------------------------------------------------------------------"
-            echo "[$_run_idx/$_total_runs]  gpu=$_gpu  backbone=$backbone  method=$method  seed=$seed"
+            echo "[$_run_idx/$_total_runs]  $_slot_label  backbone=$backbone  method=$method  seed=$seed"
             echo "  exp_name    = $exp_name"
             echo "  image_size  = $image_size"
             echo "  bs/accum    = $bs / $accum  (eff=${bs}×${accum}=$((bs * accum)) / GPU)"
@@ -343,7 +395,7 @@ for seed in $SEEDS; do
             echo "  tasks       = ${TASKS[*]}"
             echo "---------------------------------------------------------------------"
 
-            CUDA_VISIBLE_DEVICES="$_gpu" python train.py \
+            "${_launch[@]}" train.py \
                 --backbone "$backbone" \
                 --image_size "$image_size" \
                 --tasks "${TASKS[@]}" \
@@ -360,7 +412,7 @@ for seed in $SEEDS; do
                 --batch_size "$bs" \
                 --accumulate_grad_batches "$accum" \
                 --accelerator "$ACCEL" \
-                --devices 1 \
+                --devices "$_devices_arg" \
                 --strategy "$STRATEGY" \
                 --precision "$PRECISION" \
                 --log_every_n_steps "$LOG_EVERY" \
@@ -373,7 +425,7 @@ for seed in $SEEDS; do
                 $extra_args &
 
             SLOT_PID[$_slot]=$!
-            echo "Launched: $exp_name  (pid=${SLOT_PID[$_slot]}, gpu=$_gpu)"
+            echo "Launched: $exp_name  (pid=${SLOT_PID[$_slot]}, $_slot_label)"
         done
     done
 done
@@ -381,7 +433,7 @@ done
 # Drain remaining in-flight runs.
 for ((_s = 0; _s < N_GPU; _s++)); do
     if [ -n "${SLOT_PID[$_s]}" ]; then
-        wait "${SLOT_PID[$_s]}" || echo "[warn] run on GPU ${GPU_LIST[$_s]} exited non-zero"
+        wait "${SLOT_PID[$_s]}" || echo "[warn] run on slot $_s exited non-zero"
     fi
 done
 

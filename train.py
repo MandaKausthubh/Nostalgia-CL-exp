@@ -199,6 +199,14 @@ def parse_args():
         help="Local directory for per-task checkpoints",
     )
     hub_group.add_argument(
+        "--phase1_cache_dir",
+        type=str,
+        default=None,
+        help="Writable dir for the Phase-1 head-alignment cache (defaults to "
+             "--checkpoint_dir). Set explicitly when the dataset root is "
+             "read-only, e.g. Kaggle's /kaggle/input.",
+    )
+    hub_group.add_argument(
         "--resume",
         type=str,
         default="prompt",
