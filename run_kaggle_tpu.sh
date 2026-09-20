@@ -62,11 +62,99 @@ if [ "${INSTALL_DEPS:-1}" = "1" ]; then
     echo "=== [1/4] Deps ==="
     python -m pip install -q --upgrade pip
 
-    # torch_xla must match the installed torch; let pip resolve it, then report.
+    # Python 3.12 no longer ships setuptools in the venv, but torchmetrics
+    # (pulled in by Lightning) does `from pkg_resources import ...` at import
+    # time -> ModuleNotFoundError: No module named 'pkg_resources'.
+    # setuptools 82.0.0 (Feb 2026) REMOVED pkg_resources entirely, and an
+    # unqualified `pip install setuptools` grabs that latest -> still broken.
+    # Pin <82 so the bundled pkg_resources survives.
+    python -m pip install -q "setuptools<82"
+    python -c "import pkg_resources" 2>/dev/null || {
+        echo "[FATAL] pkg_resources still missing after installing setuptools<82."
+        echo "        torchmetrics/Lightning need it. Check pip target:"
+        python -c "import site,sys; print(sys.executable); print(site.getsitepackages())"
+        exit 1
+    }
+
+    # torch_xla must share torch's ABI. A mismatched wheel dies at import with
+    #   undefined symbol: _ZN5torch8autograd13_wrap_outputsE...
+    # Two gotchas, both seen on Kaggle (torch 2.10.0+cpu):
+    #   1. torch_xla LAGS torch on PyPI (newest is 2.9.0 when torch is 2.10) and
+    #      does NOT declare torch as a dependency, so pip never realigns it.
+    #   2. torch_xla's [tpu] extra pulls libtpu, whose wheels live on the Google
+    #      release index (--find-links), not PyPI.
+    # So: pick the newest torch_xla <= torch, install it + the *matching*
+    # torch/torchvision explicitly. Override with TORCH_XLA_VERSION=<ver>.
+    TORCH_VER="$(python -c 'import torch; print(torch.__version__.split("+")[0])')"
+    LIBTPU_INDEX="https://storage.googleapis.com/libtpu-releases/index.html"
+
+    # torch -> torchvision (kept consistent so other Kaggle packages still
+    # import; unknown pairs are skipped with a warning).
+    tv_for() {
+        case "$1" in
+            2.10.*) echo "0.25.0" ;;
+            2.9.*)  echo "0.24.0" ;;
+            2.8.*)  echo "0.23.0" ;;
+            2.7.*)  echo "0.22.0" ;;
+            2.6.*)  echo "0.21.0" ;;
+            2.5.*)  echo "0.20.0" ;;
+            *)      echo "" ;;
+        esac
+    }
+
     if ! python -c "import torch_xla" >/dev/null 2>&1; then
-        echo "  installing torch_xla ..."
-        python -m pip install -q torch_xla
+        XLA_VER="${TORCH_XLA_VERSION:-}"
+        if [ -z "$XLA_VER" ]; then
+            # Newest non-prerelease torch_xla <= torch's version.
+            XLA_VER="$(python -c '
+import json, sys, urllib.request
+want = tuple(int(x) for x in sys.argv[1].split(".")[:3])
+try:
+    rel = json.load(urllib.request.urlopen(
+        "https://pypi.org/pypi/torch_xla/json", timeout=30))["releases"]
+except Exception:
+    print(sys.argv[1]); raise SystemExit
+def k(v):
+    p = v.split(".")
+    return tuple(int(x) for x in p[:3]) if len(p) >= 3 and all(x.isdigit() for x in p[:3]) else None
+c = [v for v in rel if rel[v] and not any(ch.isalpha() for ch in v) and k(v) and k(v) <= want]
+print(max(c, key=k) if c else sys.argv[1])
+' "$TORCH_VER")"
+        fi
+
+        echo "  torch=$TORCH_VER -> torch_xla[tpu]==$XLA_VER"
+        [ "$XLA_VER" != "$TORCH_VER" ] && \
+            echo "  (torch_xla lags torch; will realign torch to $XLA_VER)"
+
+        # Drop any mismatched wheel a previous run left behind.
+        python -m pip uninstall -y torch_xla >/dev/null 2>&1 || true
+
+        if ! python -m pip install -q "torch_xla[tpu]==${XLA_VER}" -f "$LIBTPU_INDEX"; then
+            echo "[FATAL] no torch_xla[tpu]==${XLA_VER} wheel available."
+            echo "        torch is ${TORCH_VER}; pick a matching pair, e.g."
+            echo "          pip install torch==2.5.0 torchvision==0.20.0 'torch_xla[tpu]==2.5.0' -f $LIBTPU_INDEX"
+            echo "        or set TORCH_XLA_VERSION=<ver>."
+            exit 1
+        fi
+
+        # torch_xla does not pin torch, so realign torch + its siblings ourselves
+        # when the chosen wheel's version differs from what the image ships.
+        # torchaudio MUST be realigned too: transformers imports it (via
+        # loss_rnnt) and a stale build dies with
+        #   libtorchaudio.so: undefined symbol: ...c10::SymInt::sym_ne...
+        # torchaudio's version tracks torch's exactly (2.9.0 <-> 2.9.0).
+        if [ "$XLA_VER" != "$TORCH_VER" ]; then
+            TV_VER="$(tv_for "$XLA_VER")"
+            realign=("torch==${XLA_VER}" "torchaudio==${XLA_VER}")
+            [ -n "$TV_VER" ] && realign+=("torchvision==${TV_VER}")
+            echo "  realigning ${realign[*]} ..."
+            if ! python -m pip install -q "${realign[@]}"; then
+                echo "  [warn] realign failed; pinning torch only"
+                python -m pip install -q "torch==${XLA_VER}" || true
+            fi
+        fi
     fi
+
     # DomainNet loader imports pytorch_adapt.datasets.
     if ! python -c "import pytorch_adapt" >/dev/null 2>&1; then
         echo "  installing pytorch-adapt ..."
