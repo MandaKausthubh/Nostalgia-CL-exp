@@ -193,6 +193,25 @@ def _build_image_backbone(name: str, in_channels: int = 3, feat_dim: int = 512,
     raise ValueError(f"Unknown image backbone: {name}. Choose from resnet10, resnet18, vit, siglip.")
 
 
+def _resolve_lora_targets(backbone, candidate_sets):
+    """Pick the first LoRA target-name set whose names all appear as module leaves.
+
+    transformers refactored ViT attention (PR #41693, 2026): the projection
+    layers `query`/`value` became `q_proj`/`v_proj`. peft then raises
+    NoMatchingPeftModuleError on the stale names. Probe the live module tree so
+    both layouts work instead of hardcoding one.
+    """
+    leaves = {full.rsplit(".", 1)[-1] for full, _ in backbone.named_modules()}
+    for names in candidate_sets:
+        if all(n in leaves for n in names):
+            return list(names)
+    seen = sorted(n for n in leaves if any(k in n for k in ("proj", "query", "value", "qkv")))
+    raise ValueError(
+        f"No LoRA target names matched for {type(backbone).__name__}; tried "
+        f"{candidate_sets}. Attention-ish leaves seen: {seen[:20]}"
+    )
+
+
 def _apply_lora_to_backbone(backbone, backbone_name, lora_r, lora_alpha, lora_dropout):
     """Inject LoRA adapters into an image backbone in place (peft).
 
@@ -216,9 +235,14 @@ def _apply_lora_to_backbone(backbone, backbone_name, lora_r, lora_alpha, lora_dr
             if isinstance(child, nn.Conv2d)
         ]
     elif name == "vit":
-        target_modules = ["query", "value"]
+        # pre-#41693 ViT: query/value; post-refactor: q_proj/v_proj.
+        target_modules = _resolve_lora_targets(
+            backbone, (("query", "value"), ("q_proj", "v_proj"))
+        )
     elif name == "siglip":
-        target_modules = ["q_proj", "v_proj"]
+        target_modules = _resolve_lora_targets(
+            backbone, (("q_proj", "v_proj"), ("query", "value"))
+        )
     else:
         raise ValueError(f"LoRA not supported for backbone: {backbone_name}")
 
