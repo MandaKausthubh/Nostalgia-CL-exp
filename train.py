@@ -57,8 +57,10 @@ def parse_args():
     model_group.add_argument(
         "--precision",
         type=str,
-        default="32-true",
-        choices=["32-true", "bf16", "bf16-mixed", "16", "16-mixed"],
+        default="bf16-true",
+        choices=["32-true", "bf16", "bf16-true", "bf16-mixed", "16", "16-mixed"],
+        help="Lightning precision. Default bf16-true because bf16-mixed is "
+             "unreliable on XLA (TPU); it is also valid on CUDA/MPS.",
     )
     model_group.add_argument(
         "--pooling",
