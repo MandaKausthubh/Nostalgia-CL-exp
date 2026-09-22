@@ -83,24 +83,6 @@ VAL_EPOCHS="${VAL_EPOCHS:-3}"     # validate every N Phase-2 epochs (--val_every
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-domainnet-cl-iclr}"
 
-# ----- Crash-resume ------------------------------------------------------
-# Each run writes a resumable bundle per task boundary; a crash loses at most
-# one domain's Phase-2. RESUME=auto (no prompt — right for unattended sweeps),
-# never (always restart), prompt (ask when interactive).
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$HOME/checkpoints}"
-RESUME="${RESUME:-prompt}"
-PUSH_TO_HUB="${PUSH_TO_HUB:-0}"
-HF_HUB_NAMESPACE="${HF_HUB_NAMESPACE:-}"
-HF_HUB_PRIVATE="${HF_HUB_PRIVATE:-0}"
-mkdir -p "$CHECKPOINT_DIR"
-
-HUB_ARGS="--checkpoint_dir $CHECKPOINT_DIR --resume $RESUME"
-if [ "$PUSH_TO_HUB" = "1" ]; then
-    HUB_ARGS="$HUB_ARGS --push_to_hub"
-    [ -n "$HF_HUB_NAMESPACE" ] && HUB_ARGS="$HUB_ARGS --hf_hub_namespace $HF_HUB_NAMESPACE"
-    [ "$HF_HUB_PRIVATE" = "1" ] && HUB_ARGS="$HUB_ARGS --hf_hub_private"
-fi
-
 # ----- LoRA (always ON — no full finetuning) -----------------------------
 # r=8 (alpha=2r=16) halves the adapter Hessian dim vs r=16 (~0.3M vs ~0.6M for
 # resnet18), so Lanczos + Q build are ~2x cheaper. Raise LORA_R only if a
@@ -284,8 +266,6 @@ else
 fi
 echo "  K:          $K"
 echo "  Data root:  $DATA_ROOT_DN"
-echo "  Resume:     $RESUME  (checkpoint_dir=$CHECKPOINT_DIR)"
-echo "  Push hub:   $PUSH_TO_HUB  (namespace=${HF_HUB_NAMESPACE:-<unset>})"
 echo "  Total runs: $_total_runs  (each = 6 sequential domains)"
 echo "====================================================================="
 
@@ -325,9 +305,6 @@ for seed in $SEEDS; do
 
             # Per-method extras.
             extra_args="--base_optimizer adamw --lr $lr --head_lr $head_lr --weight_decay $weight_decay --grad_clip_val $grad_clip --seed $seed"
-            if [ -n "${PHASE1_CACHE_DIR:-}" ]; then
-                extra_args="${extra_args} --phase1_cache_dir $PHASE1_CACHE_DIR"
-            fi
             if [ "$CHANNELS_LAST" = "1" ]; then
                 extra_args="${extra_args} --channels_last"
             fi
@@ -420,7 +397,6 @@ for seed in $SEEDS; do
                 --val_every_n_epochs "$val_epochs" \
                 --wandb_project "$WANDB_PROJECT" \
                 --wandb_name "$exp_name" \
-                $HUB_ARGS \
                 $lora_args \
                 $extra_args &
 

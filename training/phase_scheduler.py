@@ -15,7 +15,6 @@ backbone has already drifted.
 """
 
 import gc
-import os
 import torch
 import lightning.pytorch as pl
 
@@ -55,12 +54,7 @@ class PhaseSchedulerCallback(pl.Callback):
                 self.schedule.append((task["name"], "head_align", task_idx))
 
         # ── Sequential Phase 2: finetune each task in order ──
-        # On resume, tasks whose Phase-2 block already completed are dropped:
-        # their weights + CL state live in the restored bundle.
-        self.resume_after_idx = int(getattr(args, "resume_after_idx", 0))
         for task_idx, task in enumerate(tasks, start=1):
-            if task_idx <= self.resume_after_idx:
-                continue
             for _ in range(args.epochs_phase2):
                 self.schedule.append((task["name"], "nostalgia", task_idx))
 
@@ -79,9 +73,6 @@ class PhaseSchedulerCallback(pl.Callback):
         self.theta_star_memory = None      # dict {id(p): tensor}
         self.replay_buffer = None           # baselines.agem.ReplayBuffer
         self.teacher_memory = None          # frozen teacher model for SDFT
-
-        # Phase-1 head-alignment cache (populated by training.pipeline on cache miss).
-        self.phase1_cache_path = getattr(args, "phase1_cache_path", None)
 
         # Phase-2 validation frequency (1 = every epoch; >1 gates limit_val_batches).
         self.val_every_n_epochs = max(1, int(getattr(args, "val_every_n_epochs", 1)))
@@ -326,19 +317,6 @@ class PhaseSchedulerCallback(pl.Callback):
 
         task_name, phase, task_idx = self.schedule[epoch]
 
-        # Phase-1 cache save: write state_dict at end of the FINAL head_align
-        # epoch. Only rank 0 writes — DDP ranks share optimizer state so the
-        # post-Phase-1 model is identical across ranks.
-        if phase == "head_align" and self.phase1_cache_path is not None:
-            next_epoch = epoch + 1
-            next_is_head_align = (
-                next_epoch < len(self.schedule)
-                and self.schedule[next_epoch][1] == "head_align"
-            )
-            if not next_is_head_align and trainer.is_global_zero:
-                self._save_phase1_cache(pl_module)
-            # fall through — if phase is head_align, the nostalgia gate below exits
-
         # Only run Phase 3 at the end of a task's Phase 2 block
         if phase != "nostalgia":
             return
@@ -542,35 +520,6 @@ class PhaseSchedulerCallback(pl.Callback):
         elif pl_module.device.type == "mps":
             torch.mps.empty_cache()
         print(f"  SDFT teacher snapshot for task '{task_name}' completed")
-
-    # ------------------------------------------------------------------
-    # Phase-1 head-alignment cache writer
-    # ------------------------------------------------------------------
-    def _save_phase1_cache(self, pl_module):
-        """Atomically write model state_dict after Phase-1 head alignment.
-
-        Heads and BN running stats are both mutated during Phase 1, so save
-        the full state_dict (not just heads). CPU-side dump avoids
-        device-specific pickles.
-        """
-        cache_path = self.phase1_cache_path
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        tmp_path = cache_path + ".tmp"
-        sd = {k: v.detach().cpu() for k, v in pl_module.state_dict().items()}
-        meta = {
-            "backbone": getattr(self.args, "backbone", None),
-            "pretrained": getattr(self.args, "pretrained", True),
-            "image_size": getattr(self.args, "image_size", None),
-            "use_lora": getattr(self.args, "use_lora", False),
-            "lora_r": getattr(self.args, "lora_r", None),
-            "lora_alpha": getattr(self.args, "lora_alpha", None),
-            "lora_dropout": getattr(self.args, "lora_dropout", None),
-            "tasks": sorted(t["name"] for t in self.tasks),
-            "epochs_phase1": getattr(self.args, "epochs_phase1", None),
-        }
-        torch.save({"state_dict": sd, "key": meta}, tmp_path)
-        os.replace(tmp_path, cache_path)
-        print(f"[Phase-1 cache] Saved: {cache_path}\n  key={meta}", flush=True)
 
     # ------------------------------------------------------------------
     # Phase-2 validation-every-N-epochs gating

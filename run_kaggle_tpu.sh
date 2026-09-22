@@ -2,13 +2,10 @@
 # Kaggle TPU v3-8 runner for the DomainNet CL sweep.
 #
 # Kaggle differences from the RunPod path this script handles:
-#   * /kaggle/input is READ-ONLY -> Phase-1 cache + checkpoints + wandb must go
-#     under /kaggle/working (PHASE1_CACHE_DIR / CHECKPOINT_DIR here).
-#   * /kaggle/working has a ~20 GB output cap, so checkpoints are the thing to
-#     watch; the resume bundle already prunes per-task copies.
+#   * /kaggle/input is READ-ONLY -> wandb must go under /kaggle/working.
+#   * /kaggle/working has a ~20 GB output cap.
 #   * torch_xla is NOT preinstalled -> INSTALL_DEPS=1 pip-installs torch_xla and
 #     pytorch-adapt (DomainNet's list-file loader needs the latter).
-#   * Sessions are preempted at ~12h -> RESUME=auto by default.
 #   * One process drives all 8 chips (Lightning XLA strategy). Runs are serial.
 #
 # Usage (from a Kaggle notebook cell):
@@ -23,8 +20,6 @@ set -euo pipefail
 REPO_DIR="${REPO_DIR:-/kaggle/working/Nostalgia-CL-exp}"
 DATA_ROOT_DN="${DATA_ROOT_DN:-/kaggle/input/datasets/kausthubhmanda/domainnet-fulldataset/domainnet}"
 WANDB_DIR="${WANDB_DIR:-/kaggle/working/wandb_logs}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/kaggle/working/checkpoints}"
-PHASE1_CACHE_DIR="${PHASE1_CACHE_DIR:-/kaggle/working/phase1_cache}"
 
 # ----- Accelerator -------------------------------------------------------
 export ACCEL="${ACCEL:-tpu}"
@@ -34,13 +29,11 @@ export PRECISION="${PRECISION:-bf16-true}"   # NOT bf16-mixed on XLA
 export NUM_WORKERS="${NUM_WORKERS:-0}"       # ignored off-CUDA anyway
 
 # ----- Run policy --------------------------------------------------------
-export RESUME="${RESUME:-auto}"        # preemption-safe; never prompts
-export PUSH_TO_HUB="${PUSH_TO_HUB:-0}"
 # Kaggle TPU VMs usually have internet, but keep wandb local-first. Set
 # WANDB_MODE=online (and WANDB_API_KEY) to stream to the dashboard.
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
-export DATA_ROOT_DN WANDB_DIR CHECKPOINT_DIR PHASE1_CACHE_DIR
+export DATA_ROOT_DN WANDB_DIR
 
 MODE="${MODE:-full}"   # full | smoke
 
@@ -49,11 +42,8 @@ echo "Kaggle TPU runner"
 echo "  REPO_DIR         = $REPO_DIR"
 echo "  DATA_ROOT_DN     = $DATA_ROOT_DN"
 echo "  WANDB_DIR        = $WANDB_DIR"
-echo "  CHECKPOINT_DIR   = $CHECKPOINT_DIR"
-echo "  PHASE1_CACHE_DIR = $PHASE1_CACHE_DIR"
 echo "  MODE             = $MODE"
 echo "  ACCEL/DEVICES    = $ACCEL / $DEVICES   (strategy=$STRATEGY, precision=$PRECISION)"
-echo "  RESUME           = $RESUME"
 echo "  WANDB_MODE       = $WANDB_MODE"
 echo "====================================================================="
 
@@ -179,7 +169,7 @@ fi
 
 # ----- 2. Writable dirs --------------------------------------------------
 echo "=== [2/4] Writable dirs ==="
-for d in "$WANDB_DIR" "$CHECKPOINT_DIR" "$PHASE1_CACHE_DIR"; do
+for d in "$WANDB_DIR"; do
     mkdir -p "$d"
     if ! touch "$d/.write_test" 2>/dev/null; then
         echo "[FATAL] $d is not writable"

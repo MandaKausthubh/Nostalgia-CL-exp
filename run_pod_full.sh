@@ -16,23 +16,6 @@ export DATA_ROOT_DN="${DATA_ROOT_DN:-$HOME/domainnet}"
 export WANDB_DIR="${WANDB_DIR:-$HOME/wandb_log}"
 REPO_DIR="${REPO_DIR:-/workspace/Nostalgia-CL-exp}"
 
-# ---------- Crash-resume ----------
-# RESUME=prompt (ask if TTY; auto when non-interactive), auto (never ask),
-# never (always restart). PUSH_TO_HUB=1 mirrors bundles to HF Hub.
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-$HOME/checkpoints}"
-RESUME="${RESUME:-prompt}"
-PUSH_TO_HUB="${PUSH_TO_HUB:-0}"
-HF_HUB_NAMESPACE="${HF_HUB_NAMESPACE:-}"
-HF_HUB_PRIVATE="${HF_HUB_PRIVATE:-0}"
-mkdir -p "$CHECKPOINT_DIR"
-
-HUB_ARGS="--checkpoint_dir $CHECKPOINT_DIR --resume $RESUME"
-if [ "$PUSH_TO_HUB" = "1" ]; then
-    HUB_ARGS="$HUB_ARGS --push_to_hub"
-    [ -n "$HF_HUB_NAMESPACE" ] && HUB_ARGS="$HUB_ARGS --hf_hub_namespace $HF_HUB_NAMESPACE"
-    [ "$HF_HUB_PRIVATE" = "1" ] && HUB_ARGS="$HUB_ARGS --hf_hub_private"
-fi
-
 # RunPod pod: 1 GPU by default. Override if multi-GPU pod.
 export ACCEL="${ACCEL:-gpu}"
 export DEVICES="${DEVICES:-1}"
@@ -108,8 +91,6 @@ echo "TASKS         = $TASKS"
 echo "MODE          = $MODE"
 echo "ACCEL/DEVICES = $ACCEL / $DEVICES"
 echo "LoRA          = $USE_LORA (r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT)"
-echo "RESUME        = $RESUME  (checkpoint_dir=$CHECKPOINT_DIR)"
-echo "PUSH_TO_HUB   = $PUSH_TO_HUB  (namespace=${HF_HUB_NAMESPACE:-<unset>})"
 
 [ -d "$REPO_DIR" ] || { echo "[FATAL] repo not found at $REPO_DIR"; exit 1; }
 [ -d "$DATA_ROOT_DN" ] || { echo "[FATAL] dataset not found at $DATA_ROOT_DN"; exit 1; }
@@ -167,7 +148,6 @@ else
         --weight_decay 1e-4 --grad_clip_val 1.0 \
         --k 16 --nostalgia_accumulation_rounds 1 \
         --nostalgia_max_hessian_batch 8 --nostalgia_num_samples 100 \
-        --checkpoint_dir "$CHECKPOINT_DIR" --resume never \
         $LORA_ARGS
     echo "[ok] smoke passed"
 fi
@@ -231,7 +211,6 @@ for method in $METHODS; do
         $VAL_EXTRA_ARGS \
         --wandb_project "domainnet-cl" \
         --wandb_name "$exp_name" \
-        $HUB_ARGS \
         $LORA_ARGS \
         $extra_args
 

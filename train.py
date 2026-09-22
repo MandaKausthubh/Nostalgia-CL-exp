@@ -176,53 +176,6 @@ def parse_args():
     log_group.add_argument("--run_debug_checks", action="store_true")
     log_group.add_argument("--seed", type=int, default=42)
 
-    # Hugging Face Hub checkpointing
-    hub_group = parser.add_argument_group("Hugging Face Hub checkpointing")
-    hub_group.add_argument(
-        "--push_to_hub",
-        action="store_true",
-        help="Save and push a checkpoint to Hugging Face at the end of every task",
-    )
-    hub_group.add_argument(
-        "--hf_hub_namespace",
-        type=str,
-        default=os.environ.get("HF_USERNAME") or os.environ.get("HF_ORG"),
-        help="Hugging Face user or organization (defaults to HF_USERNAME/HF_ORG)",
-    )
-    hub_group.add_argument(
-        "--hf_hub_private",
-        action="store_true",
-        help="Create Hugging Face Hub repositories as private repositories",
-    )
-    hub_group.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="./checkpoints",
-        help="Local directory for per-task checkpoints",
-    )
-    hub_group.add_argument(
-        "--phase1_cache_dir",
-        type=str,
-        default=None,
-        help="Writable dir for the Phase-1 head-alignment cache (defaults to "
-             "--checkpoint_dir). Set explicitly when the dataset root is "
-             "read-only, e.g. Kaggle's /kaggle/input.",
-    )
-    hub_group.add_argument(
-        "--resume",
-        type=str,
-        default="prompt",
-        choices=["prompt", "auto", "never"],
-        help="Crash-resume behaviour: 'prompt' asks if a matching bundle exists "
-             "(auto-resumes when non-interactive), 'auto' never asks, 'never' always restarts",
-    )
-    hub_group.add_argument(
-        "--resume_after_idx",
-        type=int,
-        default=0,
-        help="Internal: number of completed tasks to skip on resume (set by the pipeline)",
-    )
-
     # Trainer hardware
     trainer_group = parser.add_argument_group("Trainer")
     trainer_group.add_argument("--accelerator", type=str, default="auto")
