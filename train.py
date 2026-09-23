@@ -101,6 +101,12 @@ def parse_args():
     data_group.add_argument("--batch_size", type=int, default=8)
     data_group.add_argument("--max_train_samples", type=int, default=None)
     data_group.add_argument("--max_val_samples", type=int, default=None)
+    data_group.add_argument("--max_train_per_class", type=int, default=None,
+                            help="Cap training examples kept per (class, task/domain). "
+                                 "Class-balanced; applied before --max_train_samples. "
+                                 "E.g. DomainNet: 50 keeps 50 imgs/class x 345 classes.")
+    data_group.add_argument("--max_val_per_class", type=int, default=None,
+                            help="Cap validation examples kept per (class, task/domain).")
     data_group.add_argument(
         "--dataset_overrides",
         type=str,

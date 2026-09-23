@@ -105,6 +105,36 @@ def _maybe_subset(ds, max_samples):
     return Subset(ds, selected[:n])
 
 
+def _maybe_subset_per_class(ds, per_class):
+    """Keep at most `per_class` examples per label (class-balanced cap).
+
+    Unlike `_maybe_subset` (a total budget split across classes), this caps each
+    (class, domain) independently, so every class is guaranteed `per_class`
+    examples regardless of how imbalanced the underlying domain is.
+    """
+    if per_class is None or per_class <= 0:
+        return ds
+
+    if hasattr(ds, "labels") and isinstance(ds.labels, (list, tuple)):
+        labels = [int(lab) for lab in ds.labels]
+    else:
+        labels = [int(ds[i][1]) for i in range(len(ds))]
+
+    selected = []
+    counts = {}
+    for idx, lab in enumerate(labels):
+        lab = int(lab)
+        if counts.get(lab, 0) < per_class:
+            counts[lab] = counts.get(lab, 0) + 1
+            selected.append(idx)
+    subset = Subset(ds, selected)
+    # Keep the fast label path alive for a subsequent `_maybe_subset` call
+    # (otherwise it would open every image to recover labels).
+    if hasattr(ds, "labels"):
+        subset.labels = [labels[i] for i in selected]
+    return subset
+
+
 def _build_image_transform(in_channels: int, image_size: int = 32):
     """Build a transform that produces a (C, image_size, image_size) tensor."""
     tfs = []
@@ -133,6 +163,8 @@ class BaseImageDataModule(pl.LightningDataModule):
         batch_size: int = 32,
         max_train_samples: Optional[int] = None,
         max_val_samples: Optional[int] = None,
+        max_train_per_class: Optional[int] = None,
+        max_val_per_class: Optional[int] = None,
         image_size: int = 32,
         num_workers: int = 0,
         pin_memory: bool = False,
@@ -171,6 +203,11 @@ class BaseImageDataModule(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         train_raw = self._load_train()
         val_raw = self._load_val()
+        # Per-class cap first: it runs on the raw dataset (fast `.labels` path
+        # available for list-file loaders like DomainNet) and is the intended
+        # budget lever. The total-sample cap then trims the already-balanced set.
+        train_raw = _maybe_subset_per_class(train_raw, self.hparams.max_train_per_class)
+        val_raw = _maybe_subset_per_class(val_raw, self.hparams.max_val_per_class)
         train_raw = _maybe_subset(train_raw, self.hparams.max_train_samples)
         val_raw = _maybe_subset(val_raw, self.hparams.max_val_samples)
         self.train_ds = ImageClassificationDataset(train_raw, transform=self.transform)

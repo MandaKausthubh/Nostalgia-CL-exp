@@ -37,6 +37,8 @@ def build_dataset_config(args):
         "batch_size": args.batch_size,
         "max_train_samples": args.max_train_samples,
         "max_val_samples": args.max_val_samples,
+        "max_train_per_class": getattr(args, "max_train_per_class", None),
+        "max_val_per_class": getattr(args, "max_val_per_class", None),
         "data_root": getattr(args, "data_root", "./data"),
     }
     overrides = _parse_dataset_overrides(getattr(args, "dataset_overrides", None))
@@ -218,6 +220,8 @@ def run_sequential_pipeline(args):
                 batch_size=cfg["batch_size"],
                 max_train_samples=cfg["max_train_samples"],
                 max_val_samples=cfg["max_val_samples"],
+                max_train_per_class=cfg.get("max_train_per_class"),
+                max_val_per_class=cfg.get("max_val_per_class"),
                 image_size=getattr(args, "image_size", 32),
                 data_root=cfg["data_root"],
                 num_workers=getattr(args, "num_workers", 0),

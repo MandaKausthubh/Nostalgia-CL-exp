@@ -81,6 +81,10 @@ VAL_EVERY="${VAL_EVERY:-1.0}"     # validate once per epoch
 VAL_EPOCHS="${VAL_EPOCHS:-3}"     # validate every N Phase-2 epochs (--val_every_n_epochs)
 # Optional per-task cap on val samples (unset = full val set; changes reported acc).
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-}"
+# Optional per-(class, domain) caps. Class-balanced: MAX_TRAIN_PER_CLASS=50 keeps
+# 50 imgs/class x 345 classes = 17,250/domain (vs ~33k-121k full). Big speed lever.
+MAX_TRAIN_PER_CLASS="${MAX_TRAIN_PER_CLASS:-}"
+MAX_VAL_PER_CLASS="${MAX_VAL_PER_CLASS:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-domainnet-cl-iclr}"
 
 # ----- LoRA (always ON — no full finetuning) -----------------------------
@@ -265,6 +269,7 @@ else
     echo "  LoRA:       OFF (full finetuning)"
 fi
 echo "  K:          $K"
+echo "  per-class:  train=${MAX_TRAIN_PER_CLASS:-full}  val=${MAX_VAL_PER_CLASS:-full}"
 echo "  Data root:  $DATA_ROOT_DN"
 echo "  Total runs: $_total_runs  (each = 6 sequential domains)"
 echo "====================================================================="
@@ -310,6 +315,12 @@ for seed in $SEEDS; do
             fi
             if [ -n "$MAX_VAL_SAMPLES" ]; then
                 extra_args="${extra_args} --max_val_samples $MAX_VAL_SAMPLES"
+            fi
+            if [ -n "$MAX_TRAIN_PER_CLASS" ]; then
+                extra_args="${extra_args} --max_train_per_class $MAX_TRAIN_PER_CLASS"
+            fi
+            if [ -n "$MAX_VAL_PER_CLASS" ]; then
+                extra_args="${extra_args} --max_val_per_class $MAX_VAL_PER_CLASS"
             fi
             if [ "$method" = "nostalgia" ] || [ "$method" = "gpm" ] || [ "$method" = "ewc_nostalgia" ]; then
                 # Hessian cuts for ICLR sweep speed. With LoRA (default) the
