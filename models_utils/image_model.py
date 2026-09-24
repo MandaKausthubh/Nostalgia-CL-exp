@@ -463,11 +463,13 @@ class ImageModelModule(pl.LightningModule):
                 logits, teacher_logits, temperature=self.sdft_temperature
             )
             loss = loss + self.sdft_lambda_distillation * kl
+            # sync_dist=False for the same per-step-collective reason as the
+            # {stage}/loss logs below.
             self.log(
                 f"{stage}/sdft_kl_loss",
                 kl,
                 prog_bar=False,
-                sync_dist=True,
+                sync_dist=False,
                 on_step=True,
                 on_epoch=True,
                 add_dataloader_idx=False,
@@ -476,7 +478,7 @@ class ImageModelModule(pl.LightningModule):
                 f"{stage}/sdft_total_loss",
                 loss,
                 prog_bar=False,
-                sync_dist=True,
+                sync_dist=False,
                 on_step=True,
                 on_epoch=True,
                 add_dataloader_idx=False,
@@ -487,9 +489,15 @@ class ImageModelModule(pl.LightningModule):
 
         # Log CE loss as the canonical {stage}/loss so all methods are comparable.
         # For SDFT the distillation-augmented loss is still used for backprop and logged separately.
+        # sync_dist=False on the per-step logs is deliberate: sync_dist triggers a
+        # mesh_reduce collective on EVERY step, so a single straggler rank (e.g.
+        # one blocked writing its stdout through a congested notebook iopub)
+        # hangs all 8 chips in the rendezvous with no further output. Per-step
+        # train metrics are per-rank quantities anyway; epoch-level val logging
+        # below keeps sync_dist=True, which is one collective per epoch.
         if stage.endswith("/train") or stage.endswith("/alignment"):
-            self.log(f"{stage}/loss", ce_loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
-            self.log(f"{stage}/acc", acc, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
+            self.log(f"{stage}/loss", ce_loss, prog_bar=True, sync_dist=False, on_step=True, on_epoch=True)
+            self.log(f"{stage}/acc", acc, prog_bar=True, sync_dist=False, on_step=True, on_epoch=True)
         else:
             self.log(f"{stage}/loss", ce_loss, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True, add_dataloader_idx=False)
             self.log(f"{stage}/acc", acc, prog_bar=True, sync_dist=True, on_step=False, on_epoch=True, add_dataloader_idx=False)
@@ -599,11 +607,15 @@ class ImageModelModule(pl.LightningModule):
 
         stage = f"{task_name}/validation"
         loss, acc = self._shared_step(batch, stage, task_name=task_name)
+        # Accumulate host scalars, not device tensors: an epoch of validation
+        # spans every started task, so device-resident accumulators pin one XLA
+        # buffer per step (~500/epoch) until epoch end. The XLA allocator does
+        # not return those, and the resulting fragmentation is what makes later
+        # tasks OOM on an already-tight 16 GB chip.
         if loss is not None:
-            self._val_losses_per_task.setdefault(task_name, []).append(loss.detach())
+            self._val_losses_per_task.setdefault(task_name, []).append(float(loss))
         if acc is not None:
-            acc_t = acc.detach() if isinstance(acc, torch.Tensor) else torch.tensor(acc, device=self.device)
-            self._val_accs_per_task.setdefault(task_name, []).append(acc_t)
+            self._val_accs_per_task.setdefault(task_name, []).append(float(acc))
 
         logits = getattr(self, "_last_logits", None)
         if logits is not None:
@@ -622,11 +634,11 @@ class ImageModelModule(pl.LightningModule):
         for task_name, losses in getattr(self, "_val_losses_per_task", {}).items():
             if task_name not in started or not losses:
                 continue
-            task_losses.append(torch.stack(losses).mean())
+            task_losses.append(torch.tensor(sum(losses) / len(losses), device=self.device))
         for task_name, accs in getattr(self, "_val_accs_per_task", {}).items():
-            if task_name not in started or not losses:
+            if task_name not in started or not accs:
                 continue
-            task_accs.append(torch.stack(accs).mean())
+            task_accs.append(torch.tensor(sum(accs) / len(accs), device=self.device))
 
         if task_losses:
             self.log("total/validation/loss", torch.stack(task_losses).mean(),

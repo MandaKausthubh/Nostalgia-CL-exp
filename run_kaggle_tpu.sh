@@ -30,8 +30,38 @@ export NUM_WORKERS="${NUM_WORKERS:-0}"       # ignored off-CUDA anyway
 
 # ----- Run policy --------------------------------------------------------
 # Kaggle TPU VMs usually have internet, but keep wandb local-first. Set
-# WANDB_MODE=online (and WANDB_API_KEY) to stream to the dashboard.
+# WANDB_MODE=online to stream to the dashboard.
 export WANDB_MODE="${WANDB_MODE:-offline}"
+
+# Kaggle exposes no shell env for secrets, so pull the wandb key from the
+# notebook's Secrets store (Add-ons > Secrets) instead of pasting a credential
+# into a cell. Tries a few labels; no-op when WANDB_API_KEY is already set or
+# the store is unavailable. Without a key, wandb "online" would just fail on
+# login, so fall back to offline rather than lose the run.
+if [ "$WANDB_MODE" = "online" ] && [ -z "${WANDB_API_KEY:-}" ]; then
+    _key="$(python - <<'PY'
+for label in ("WANDB_API_KEY", "WANDB_KEY", "wandb-api-key"):
+    try:
+        from kaggle_secrets import UserSecretsClient
+        val = UserSecretsClient().get_secret(label)
+    except Exception:
+        val = None
+    if val:
+        print(val.strip())
+        break
+PY
+)"
+    if [ -n "$_key" ]; then
+        export WANDB_API_KEY="$_key"
+        echo "  [ok] WANDB_API_KEY loaded from Kaggle Secrets"
+    else
+        echo "  [warn] WANDB_MODE=online but no key in Kaggle Secrets."
+        echo "         Add secret 'WANDB_API_KEY' (Add-ons > Secrets), then re-run."
+        echo "         Falling back to WANDB_MODE=offline."
+        export WANDB_MODE=offline
+    fi
+    unset _key
+fi
 
 export DATA_ROOT_DN WANDB_DIR
 
